@@ -1,0 +1,12 @@
+# Build / object output
+o/
+aof/
+linked/
+*.o
+*.obj
+
+# Editor / OS cruft
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
