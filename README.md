@@ -36,6 +36,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables — implementation patch | ✅ drafted (build-unverified) |
+| **M3b/c** | Drive-number widening (record index + address routing) | ✅ drafted (build-unverified) |
 | M4 | G-format read support in FileCore (ARM) | planned |
 | M5 | G-format write / allocation (ARM) | planned |
 | M6 | Format/layout SWIs + ADFS/SCSIFS integration | planned |
@@ -76,6 +77,7 @@ tools/gfcref/   Host-side reference formatter / checker / journaller
 - [`design/04-Journaling-v1.md`](design/04-Journaling-v1.md) — journaling hooks (FileCore API + reference).
 - [`design/05-256Drives-v1.md`](design/05-256Drives-v1.md) — 256-drive gap analysis & change design.
 - [`design/06-M3a-DynamicDriveTables.md`](design/06-M3a-DynamicDriveTables.md) — M3a implementation patch (ARM).
+- [`design/07-M3bc-DriveNumberWidening.md`](design/07-M3bc-DriveNumberWidening.md) — M3b/M3c drive-number widening (ARM).
 
 ## License
 
