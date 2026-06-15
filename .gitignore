@@ -15,3 +15,7 @@ tools/gfcref/gfctool.exe
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# scratch test fixtures
+tools/gfcref/*.txt
+tools/gfcref/*.bin

@@ -1,1 +1,0 @@
-Hello G-format world! This is a reference file.
