@@ -134,6 +134,10 @@ static int map_get(const uint8_t *map, const gfc_geom *g, uint32_t c){
     uint32_t z=c/g->bits_per_zone, b=c%g->bits_per_zone;
     return (map[z*g->sector_size + ZONE_HDR_BYTES + b/8] >> (b&7)) & 1;
 }
+static void map_clear(uint8_t *map, const gfc_geom *g, uint32_t c){
+    uint32_t z=c/g->bits_per_zone, b=c%g->bits_per_zone;
+    map[z*g->sector_size + ZONE_HDR_BYTES + b/8] &= (uint8_t)~(1u<<(b&7));
+}
 
 /*
  * Mark the reserved/allocated clusters for AG i and return (via *free_out)
@@ -343,6 +347,30 @@ static int alloc_clusters(FILE *f, const gfc_geom *g, uint64_t need,
     }
     free(map); free(h);
     return need==0 ? 0 : -1;
+}
+
+/* Free the given cluster sectors (clearing map bits), per affected AG.
+ * Persists each touched AG's map + header. */
+static void free_clusters(FILE *f, const gfc_geom *g, const uint64_t *secs, int n)
+{
+    uint8_t *map=malloc((size_t)g->map_zones*g->sector_size), *h=malloc(g->sector_size);
+    for (uint64_t i=0;i<g->agcount;i++){
+        int touched=0;
+        for (int j=0;j<n;j++) if (sec_to_ag(g,secs[j])==i){
+            if (!touched){ for (uint16_t z=0;z<g->map_zones;z++) read_sector(f,g,ag_map_start(g,i)+z,map+(uint32_t)z*g->sector_size); touched=1; }
+            map_clear(map,g,sec_to_localclu(g,secs[j]));
+        }
+        if (touched){
+            map_finalise_checks(map,g);
+            uint64_t fr,lg; map_scan_free(map,g,ag_real_clusters(g,i),&fr,&lg);
+            for (uint16_t z=0;z<g->map_zones;z++) write_sector(f,g,ag_map_start(g,i)+z,map+(uint32_t)z*g->sector_size);
+            read_sector(f,g,ag_header_sector(g,i),h);
+            put_u64(h+AGH_ClustersFree,fr); put_u64(h+AGH_LargestFreeRun,lg);
+            put_u32(h+g->sector_size-4,gfc_struct_check(h,g->sector_size));
+            write_sector(f,g,ag_header_sector(g,i),h);
+        }
+    }
+    free(map); free(h);
 }
 
 /* ====================================================================== */
@@ -887,6 +915,59 @@ static int cmd_read(int argc, char **argv)
     return 0;
 }
 
+static int cmd_delete(int argc, char **argv)
+{
+    if (argc<2){ fprintf(stderr,"usage: gfctool delete <image> <name>\n"); return 2; }
+    const char *imgp=argv[0], *name=argv[1];
+    FILE *f=fopen(imgp,"rb+"); if(!f){ perror("fopen image"); return 1; }
+    gfc_geom g; char err[128]; uint8_t sb[4096];
+    if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
+    uint32_t clu_bytes=1u<<g.log2_bpmb;
+
+    /* find the entry */
+    uint8_t *root=calloc(1,clu_bytes);
+    read_run(f,&g,ag_data_start(&g,0),1,root);
+    uint32_t nent=get_u32(root+OBJ_HDR_BYTES); uint32_t idx=nent; uint64_t hdr_sec=0;
+    for (uint32_t e=0;e<nent;e++){
+        const uint8_t *de=root+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
+        for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
+        if (!strcmp(nm,name)){ idx=e; hdr_sec=get_u64(de+DE_StartSector); break; }
+    }
+    if (idx==nent){ fprintf(stderr,"'%s' not found\n",name); free(root); fclose(f); return 1; }
+
+    /* gather clusters to free: header + every extent cluster */
+    uint8_t *hc=calloc(1,clu_bytes);
+    read_run(f,&g,hdr_sec,1,hc);
+    uint16_t nx=get_u16(hc+OBJ_ExtentCount);
+    uint64_t cap=1+get_u64(hc+OBJ_ClusterCount), nf=0, *secs=malloc((cap+1)*sizeof*secs);
+    secs[nf++]=hdr_sec;
+    for (uint16_t e=0;e<nx;e++){
+        uint64_t st=get_u64(hc+OBJ_HDR_BYTES+(size_t)e*EXTENT_BYTES+EXT_StartSector);
+        uint64_t cc=get_u64(hc+OBJ_HDR_BYTES+(size_t)e*EXTENT_BYTES+EXT_ClusterCount);
+        for (uint64_t k=0;k<cc;k++) secs[nf++]=st+(k<<g.log2_secs_per_clu);
+    }
+    free(hc);
+
+    /* journalled transaction: free clusters + remove dir entry */
+    char tag[80]; snprintf(tag,sizeof tag,"delete %s",name);
+    int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
+    free_clusters(f,&g,secs,(int)nf);
+    /* compact the entry array */
+    uint8_t *base=root+OBJ_HDR_BYTES+4;
+    memmove(base+(size_t)idx*DIRENT_BYTES, base+(size_t)(idx+1)*DIRENT_BYTES,
+            (size_t)(nent-idx-1)*DIRENT_BYTES);
+    put_u32(root+OBJ_HDR_BYTES,nent-1);
+    put_u64(root+OBJ_Length,4+(uint64_t)(nent-1)*DIRENT_BYTES);
+    put_u32(root+OBJ_HdrCheck,sum_words(root,OBJ_HdrCheck));
+    write_run(f,&g,ag_data_start(&g,0),1,root);
+    if (jrn){ jcommit(); jclose(); }
+    free(secs); free(root); fclose(f);
+
+    printf("deleted '%s' (freed %llu cluster(s))\n",name,(unsigned long long)nf);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc<2){
@@ -896,6 +977,7 @@ int main(int argc, char **argv)
           "  gfctool format <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]\n"
           "  gfctool mkfile  <image> <name> <srcfile>\n"
           "  gfctool read    <image> <name> <outfile>\n"
+          "  gfctool delete  <image> <name>\n"
           "  gfctool ls      <image>\n"
           "  gfctool journal <image>\n"
           "  gfctool rewind  <image> [--to TXN]\n"
@@ -907,6 +989,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1],"format"))  return cmd_format (argc-2,argv+2);
     if (!strcmp(argv[1],"mkfile"))  return cmd_mkfile (argc-2,argv+2);
     if (!strcmp(argv[1],"read"))    return cmd_read   (argc-2,argv+2);
+    if (!strcmp(argv[1],"delete"))  return cmd_delete (argc-2,argv+2);
     if (!strcmp(argv[1],"ls"))      return cmd_ls     (argc-2,argv+2);
     if (!strcmp(argv[1],"journal")) return cmd_journal(argc-2,argv+2);
     if (!strcmp(argv[1],"rewind"))  return cmd_rewind (argc-2,argv+2);

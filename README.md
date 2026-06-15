@@ -34,6 +34,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1** | C reference formatter + checker | ✅ done |
 | **M1b** | Object & directory model (`mkfile` / `ls`) | ✅ done |
 | **M1c** | Multi-extent, cross-AG files + `read` | ✅ done |
+| **M1d** | `delete` (cross-AG free + reuse, journalled) | ✅ done |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables — implementation patch | ✅ drafted (build-unverified) |

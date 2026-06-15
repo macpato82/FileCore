@@ -24,6 +24,7 @@ Or directly: `gcc -std=c99 -O2 -Wall -o gfctool gfctool.c gfc_check.c`
 gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
 gfctool mkfile  <image> <name> <srcfile>   # journalled; multi-extent, cross-AG
 gfctool read    <image> <name> <outfile>   # extract a file's contents
+gfctool delete  <image> <name>              # journalled; frees clusters across AGs
 gfctool ls      <image>
 gfctool journal <image>                     # list journal transactions
 gfctool rewind  <image> [--to TXN]          # undo last txn (or back to TXN)
