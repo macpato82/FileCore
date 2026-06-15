@@ -22,10 +22,11 @@ Or directly: `gcc -std=c99 -O2 -Wall -o gfctool gfctool.c gfc_check.c`
 
 ```
 gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
-gfctool mkfile  <image> <name> <srcfile>   # journalled; multi-extent, cross-AG
-gfctool read    <image> <name> <outfile>   # extract a file's contents
-gfctool delete  <image> <name>              # journalled; frees clusters across AGs
-gfctool ls      <image>
+gfctool mkfile  <image> <path> <srcfile>   # journalled; multi-extent, cross-AG
+gfctool read    <image> <path> <outfile>   # extract a file's contents
+gfctool delete  <image> <path>              # journalled; frees clusters; rmdir if empty
+gfctool mkdir   <image> <path>              # create a subdirectory (journalled)
+gfctool ls      <image> [path]              # paths use '/' (-> RISC OS '.')
 gfctool journal <image>                     # list journal transactions
 gfctool rewind  <image> [--to TXN]          # undo last txn (or back to TXN)
 gfctool check   <image>
@@ -94,9 +95,15 @@ Verified: a 200 KB file on a disc of 128-cluster AGs lands in 4 extents across 4
 byte-identical (SHA-256), `check` passes, and `rewind` of that cross-AG write restores the
 formatted image byte-for-byte.
 
+## Directories & paths (v1.2)
+
+Full directory tree (`mkdir`, nested paths); see [design/09](../../design/09-Directories-v1.md).
+Paths use `/` (maps to RISC OS `.`). `check` walks the whole tree and proves each AG's map equals
+the union of reserved clusters and every object's clusters (sub-dirs, file headers, all extents) —
+no leaks/overlaps disc-wide. `delete` of a directory is refused unless empty (rmdir).
+
 ## Scope / v1 limitations
-- Sub-directory creation (`mkdir` / nested paths) is a later milestone; only the root directory.
-- Root directory is a single cluster (~100 entries at 4 KB); overflow reports "root full".
+- Directories are single-cluster (~100 entries at 4 KB); overflow reports "directory full".
 - Allocation is first-fit (no best-fit / locality optimisation).
 - Per-AG allocation uses a **cluster bitmap + extents** model (see design/02 §3 and
   design/03), not the E+ fragment/free-chain; the production port may adopt either.

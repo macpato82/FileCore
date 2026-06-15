@@ -373,6 +373,68 @@ static void free_clusters(FILE *f, const gfc_geom *g, const uint64_t *secs, int 
     free(map); free(h);
 }
 
+/* ---- directory navigation (paths use '/' ; maps to RISC OS '.') ---- */
+
+/* find `name` in directory at dir_sec; returns 1 + fills out_sec/out_type */
+static int dir_find(FILE *f, const gfc_geom *g, uint64_t dir_sec, const char *name,
+                    uint64_t *out_sec, uint8_t *out_type){
+    uint32_t cb=1u<<g->log2_bpmb; uint8_t *d=calloc(1,cb);
+    read_run(f,g,dir_sec,1,d);
+    uint32_t n=get_u32(d+OBJ_HDR_BYTES); int found=0;
+    for (uint32_t e=0;e<n;e++){
+        const uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
+        for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
+        if(!strcmp(nm,name)){ if(out_sec)*out_sec=get_u64(de+DE_StartSector); if(out_type)*out_type=de[DE_Type]; found=1; break; }
+    }
+    free(d); return found;
+}
+
+/* descend the leading components of `path`, returning the parent dir sector
+ * and the final leaf name. Returns 0 if an intermediate dir is missing. */
+static uint64_t resolve_parent(FILE *f, const gfc_geom *g, const char *path, char *leaf, size_t leafsz){
+    uint64_t cur=ag_data_start(g,0);            /* root */
+    char buf[1024]; strncpy(buf,path,sizeof buf-1); buf[sizeof buf-1]=0;
+    char *p=buf, *slash;
+    while ((slash=strchr(p,'/'))!=NULL){
+        *slash=0;
+        if (*p){ uint64_t ns; uint8_t ty; if(!dir_find(f,g,cur,p,&ns,&ty)||ty!=OBJ_TYPE_DIR) return 0; cur=ns; }
+        p=slash+1;
+    }
+    strncpy(leaf,p,leafsz-1); leaf[leafsz-1]=0;
+    return cur;
+}
+
+/* resolve a full path to a directory sector (every component is a dir). */
+static uint64_t resolve_dir(FILE *f, const gfc_geom *g, const char *path){
+    uint64_t cur=ag_data_start(g,0);
+    if (!path||!*path) return cur;
+    char buf[1024]; strncpy(buf,path,sizeof buf-1); buf[sizeof buf-1]=0;
+    char *p=strtok(buf,"/");
+    while (p){ uint64_t ns; uint8_t ty; if(!dir_find(f,g,cur,p,&ns,&ty)||ty!=OBJ_TYPE_DIR) return 0; cur=ns; p=strtok(NULL,"/"); }
+    return cur;
+}
+
+/* append an entry to the directory at dir_sec; -1 if the (single-cluster) dir is full */
+static int dir_add_entry(FILE *f, const gfc_geom *g, uint64_t dir_sec, const char *name,
+                         uint8_t type, uint32_t load, uint32_t exec, uint64_t length, uint64_t start_sec){
+    uint32_t cb=1u<<g->log2_bpmb; uint8_t *d=calloc(1,cb);
+    read_run(f,g,dir_sec,1,d);
+    uint32_t n=get_u32(d+OBJ_HDR_BYTES);
+    uint64_t capb=get_u64(d+OBJ_ClusterCount)*cb;
+    if (OBJ_HDR_BYTES+4+(uint64_t)(n+1)*DIRENT_BYTES > capb){ free(d); return -1; }
+    uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)n*DIRENT_BYTES;
+    memset(de,0,DIRENT_BYTES); memset(de+DE_Name,' ',DE_NameLen);
+    { size_t l=strlen(name); if(l>DE_NameLen)l=DE_NameLen; memcpy(de+DE_Name,name,l); }
+    de[DE_Type]=type; de[DE_Attrs]=0x03;
+    put_u32(de+DE_Load,load); put_u32(de+DE_Exec,exec);
+    put_u64(de+DE_Length,length); put_u64(de+DE_StartSector,start_sec);
+    put_u32(d+OBJ_HDR_BYTES,n+1);
+    put_u64(d+OBJ_Length,4+(uint64_t)(n+1)*DIRENT_BYTES);
+    put_u32(d+OBJ_HdrCheck,sum_words(d,OBJ_HdrCheck));
+    write_run(f,g,dir_sec,1,d); free(d); return 0;
+}
+
 /* ====================================================================== */
 static int cmd_format(int argc, char **argv)
 {
@@ -485,6 +547,59 @@ static int cmd_info(int argc, char **argv)
     fclose(f); return 0;
 }
 
+/* growable set of (AG, local cluster) pairs collected while walking the tree */
+typedef struct { uint64_t *ag; uint32_t *lc; uint64_t cap, M; } cluset;
+static void cluset_add(cluset *s, const gfc_geom *g, uint64_t sec){
+    if (s->M==s->cap){ s->cap*=2; s->ag=realloc(s->ag,s->cap*sizeof*s->ag); s->lc=realloc(s->lc,s->cap*sizeof*s->lc); }
+    s->ag[s->M]=sec_to_ag(g,sec); s->lc[s->M]=sec_to_localclu(g,sec); s->M++;
+}
+#define CFAIL(...) do{ fprintf(stderr,"FAIL: "); fprintf(stderr,__VA_ARGS__); fprintf(stderr,"\n"); err++; }while(0)
+/* validate the directory at dir_sec and collect every cluster it (recursively) owns */
+static int collect_tree(FILE *f, const gfc_geom *g, uint64_t dir_sec, cluset *s, int depth)
+{
+    int err=0;
+    if (depth>64){ fprintf(stderr,"FAIL: directory nesting too deep\n"); return 1; }
+    uint32_t cb=1u<<g->log2_bpmb; uint8_t *d=calloc(1,cb);
+    if (read_run(f,g,dir_sec,1,d)){ CFAIL("cannot read directory @ sector %llu",(unsigned long long)dir_sec); free(d); return err; }
+    if (get_u32(d+OBJ_Magic)!=GFC_OBJ_MAGIC) CFAIL("dir @ %llu bad magic",(unsigned long long)dir_sec);
+    if (d[OBJ_Type]!=OBJ_TYPE_DIR) CFAIL("object @ %llu is not a directory",(unsigned long long)dir_sec);
+    if (get_u32(d+OBJ_HdrCheck)!=sum_words(d,OBJ_HdrCheck)) CFAIL("dir @ %llu header checksum",(unsigned long long)dir_sec);
+    uint32_t n=get_u32(d+OBJ_HDR_BYTES);
+    for (uint32_t e=0;e<n;e++){
+        const uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        uint64_t st=get_u64(de+DE_StartSector); uint8_t ty=de[DE_Type];
+        char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
+        for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
+        if (st>=g->total_sectors){ CFAIL("'%s' entry out of range",nm); continue; }
+        if (ty==OBJ_TYPE_DIR){
+            cluset_add(s,g,st);                       /* subdirectory cluster */
+            err += collect_tree(f,g,st,s,depth+1);    /* recurse */
+        } else {
+            uint8_t *hc=calloc(1,cb); read_run(f,g,st,1,hc);
+            if (get_u32(hc+OBJ_Magic)!=GFC_OBJ_MAGIC) CFAIL("'%s' object bad magic",nm);
+            else if (get_u32(hc+OBJ_HdrCheck)!=sum_words(hc,OBJ_HdrCheck)) CFAIL("'%s' object header checksum",nm);
+            else {
+                cluset_add(s,g,st);                   /* file header cluster */
+                uint16_t nx=get_u16(hc+OBJ_ExtentCount); uint64_t dc=0;
+                for (uint16_t x=0;x<nx;x++){
+                    uint64_t es=get_u64(hc+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_StartSector);
+                    uint64_t ec=get_u64(hc+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_ClusterCount);
+                    for (uint64_t k=0;k<ec;k++){
+                        uint64_t sec=es+(k<<g->log2_secs_per_clu);
+                        if (sec>=g->total_sectors){ CFAIL("'%s' extent out of range",nm); break; }
+                        cluset_add(s,g,sec);
+                    }
+                    dc+=ec;
+                }
+                if (dc!=get_u64(hc+OBJ_ClusterCount)) CFAIL("'%s' DataClusters != sum of extents",nm);
+            }
+            free(hc);
+        }
+    }
+    free(d); return err;
+}
+#undef CFAIL
+
 #define FAIL(...) do{ fprintf(stderr,"FAIL: "); fprintf(stderr,__VA_ARGS__); fprintf(stderr,"\n"); nerr++; }while(0)
 
 static int cmd_check(int argc, char **argv)
@@ -512,44 +627,10 @@ static int cmd_check(int argc, char **argv)
     if (get_u64(sb+SB_AGCount)!=g.agcount) FAIL("AGCount field %llu != computed %llu",
         (unsigned long long)get_u64(sb+SB_AGCount),(unsigned long long)g.agcount);
 
-    /* 3. walk root: validate objects, collect every referenced cluster as (AG, localclu) */
-    uint32_t clu_bytes = 1u<<g.log2_bpmb;
-    uint8_t *root = calloc(1,clu_bytes);
-    if (read_run(f,&g,ag_data_start(&g,0),1,root)) FAIL("cannot read root directory");
-    if (get_u32(root+OBJ_Magic)!=GFC_OBJ_MAGIC) FAIL("root object bad magic");
-    if (root[OBJ_Type]!=OBJ_TYPE_DIR) FAIL("root object is not a directory");
-    if (get_u32(root+OBJ_HdrCheck)!=sum_words(root,OBJ_HdrCheck)) FAIL("root object header checksum");
-    uint32_t nent = get_u32(root+OBJ_HDR_BYTES);
-
-    uint64_t cap=64, M=0; uint64_t *cl_ag=malloc(cap*sizeof*cl_ag); uint32_t *cl_lc=malloc(cap*sizeof*cl_lc);
-    #define ADDCLU(SEC) do{ uint64_t _s=(SEC); if(M==cap){cap*=2; cl_ag=realloc(cl_ag,cap*sizeof*cl_ag); cl_lc=realloc(cl_lc,cap*sizeof*cl_lc);} cl_ag[M]=sec_to_ag(&g,_s); cl_lc[M]=sec_to_localclu(&g,_s); M++; }while(0)
-
-    for (uint32_t e=0;e<nent;e++){
-        const uint8_t *de=root+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
-        uint64_t st=get_u64(de+DE_StartSector);
-        char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
-        uint8_t *oh=calloc(1,clu_bytes);
-        if (read_run(f,&g,st,1,oh)){ FAIL("entry '%s': cannot read object",nm); free(oh); continue; }
-        if (get_u32(oh+OBJ_Magic)!=GFC_OBJ_MAGIC) FAIL("entry '%s': object bad magic",nm);
-        if (get_u32(oh+OBJ_HdrCheck)!=sum_words(oh,OBJ_HdrCheck)) FAIL("entry '%s': object header checksum",nm);
-        if (get_u64(oh+OBJ_StartSector)!=st) FAIL("entry '%s': object StartSector mismatch",nm);
-        if (st>=g.total_sectors){ FAIL("entry '%s': header out of range",nm); free(oh); continue; }
-        ADDCLU(st);                                          /* header cluster */
-        uint16_t nx=get_u16(oh+OBJ_ExtentCount);
-        uint64_t dc=0;
-        for (uint16_t x=0;x<nx;x++){
-            uint64_t es=get_u64(oh+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_StartSector);
-            uint64_t ec=get_u64(oh+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_ClusterCount);
-            for (uint64_t k=0;k<ec;k++){
-                uint64_t sec=es+(k<<g.log2_secs_per_clu);
-                if (sec>=g.total_sectors){ FAIL("entry '%s': extent cluster out of range",nm); break; }
-                ADDCLU(sec);
-            }
-            dc+=ec;
-        }
-        if (dc!=get_u64(oh+OBJ_ClusterCount)) FAIL("entry '%s': DataClusters != sum of extents",nm);
-        free(oh);
-    }
+    /* 3. recursively walk the directory tree from root, validating objects and
+     *    collecting every cluster they own (header clusters, file extents, subdirs). */
+    cluset S; S.cap=64; S.M=0; S.ag=malloc(S.cap*sizeof*S.ag); S.lc=malloc(S.cap*sizeof*S.lc);
+    nerr += collect_tree(f,&g,ag_data_start(&g,0),&S,0);
 
     /* 4. each AG header + map, with collected object clusters applied to its AG */
     uint8_t *h=malloc(g.sector_size), *map=malloc((size_t)g.map_zones*g.sector_size);
@@ -574,7 +655,7 @@ static int cmd_check(int argc, char **argv)
         uint64_t cfree,ctot,lg, real=ag_real_clusters(&g,i);
         memset(exp,0,(size_t)g.map_zones*g.sector_size);
         ag_reserved_bits(exp,&g,i,1,&cfree,&ctot);            /* reserved (+root in AG0) */
-        for (uint64_t m=0;m<M;m++) if (cl_ag[m]==i) map_set(exp,&g,cl_lc[m]);
+        for (uint64_t m=0;m<S.M;m++) if (S.ag[m]==i) map_set(exp,&g,S.lc[m]);
         map_scan_free(exp,&g,real,&cfree,&lg);                /* free after objects */
         for (uint32_t c=0;c<g.clusters_per_ag;c++)
             if (map_get(map,&g,c)!=map_get(exp,&g,c)){ FAIL("AG %llu cluster %u allocation bit mismatch (map vs objects)",(unsigned long long)i,c); break; }
@@ -582,8 +663,7 @@ static int cmd_check(int argc, char **argv)
             (unsigned long long)i,(unsigned long long)get_u64(h+AGH_ClustersFree),(unsigned long long)cfree);
         if (get_u64(h+AGH_ClustersTotal)!=ctot) FAIL("AG %llu ClustersTotal mismatch",(unsigned long long)i);
     }
-    free(h); free(map); free(exp); free(root); free(cl_ag); free(cl_lc);
-    #undef ADDCLU
+    free(h); free(map); free(exp); free(S.ag); free(S.lc);
 
     fclose(f);
     if (nerr){ printf("CHECK FAILED: %d error(s)\n",nerr); return 1; }
@@ -769,23 +849,26 @@ static int cmd_rewind(int argc, char **argv)
 
 static int cmd_ls(int argc, char **argv)
 {
-    if (argc<1){ fprintf(stderr,"usage: gfctool ls <image>\n"); return 2; }
+    if (argc<1){ fprintf(stderr,"usage: gfctool ls <image> [path]\n"); return 2; }
+    const char *path = argc>1 ? argv[1] : "";
     FILE *f=fopen(argv[0],"rb"); if(!f){ perror("fopen"); return 1; }
     gfc_geom g; char err[128]; uint8_t sb[4096];
     if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
-    uint8_t *root=calloc(1,1u<<g.log2_bpmb);
-    if (read_run(f,&g,ag_data_start(&g,0),1,root)){ fprintf(stderr,"cannot read root\n"); free(root); fclose(f); return 1; }
-    uint32_t nent=get_u32(root+OBJ_HDR_BYTES);
-    printf("$ (%u object%s)\n", nent, nent==1?"":"s");
+    uint64_t dir_sec=resolve_dir(f,&g,path);
+    if (!dir_sec){ fprintf(stderr,"directory not found: %s\n",path); fclose(f); return 1; }
+    uint8_t *d=calloc(1,1u<<g.log2_bpmb);
+    if (read_run(f,&g,dir_sec,1,d)){ fprintf(stderr,"cannot read directory\n"); free(d); fclose(f); return 1; }
+    uint32_t nent=get_u32(d+OBJ_HDR_BYTES);
+    printf("%s (%u object%s)\n", (path&&*path)?path:"$", nent, nent==1?"":"s");
     for (uint32_t e=0;e<nent;e++){
-        const uint8_t *de=root+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        const uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
         char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
         for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
         printf("  %-12s  %-4s  %10llu bytes  load=%08x exec=%08x\n",
                nm, de[DE_Type]==OBJ_TYPE_DIR?"dir":"file",
                (unsigned long long)get_u64(de+DE_Length), get_u32(de+DE_Load), get_u32(de+DE_Exec));
     }
-    free(root); fclose(f); return 0;
+    free(d); fclose(f); return 0;
 }
 
 static int cmd_mkfile(int argc, char **argv)
@@ -798,6 +881,9 @@ static int cmd_mkfile(int argc, char **argv)
     uint32_t clu_bytes=1u<<g.log2_bpmb;
     int max_ext=(clu_bytes-OBJ_HDR_BYTES)/EXTENT_BYTES;
 
+    char leaf[64]; uint64_t parent=resolve_parent(f,&g,name,leaf,sizeof leaf);
+    if(!parent){ fprintf(stderr,"path not found: %s\n",name); fclose(f); return 1; }
+
     FILE *s=fopen(srcp,"rb"); if(!s){ perror("fopen src"); fclose(f); return 1; }
     gfc_fseek(s,0,SEEK_END); uint64_t fsize=(uint64_t)gfc_ftell(s); gfc_fseek(s,0,SEEK_SET);
     uint64_t data_clu=ceil_div(fsize, clu_bytes);          /* data clusters (header is separate) */
@@ -806,6 +892,10 @@ static int cmd_mkfile(int argc, char **argv)
     if (total_free_clusters(f,&g) < data_clu+1){
         fprintf(stderr,"not enough free space (%llu clusters needed)\n",(unsigned long long)(data_clu+1));
         fclose(s); fclose(f); return 1; }
+    /* precheck parent directory has room (avoid orphaning clusters) */
+    { uint8_t *pd=calloc(1,clu_bytes); read_run(f,&g,parent,1,pd);
+      uint32_t pn=get_u32(pd+OBJ_HDR_BYTES); uint64_t cap=get_u64(pd+OBJ_ClusterCount)*clu_bytes; free(pd);
+      if (OBJ_HDR_BYTES+4+(uint64_t)(pn+1)*DIRENT_BYTES > cap){ fprintf(stderr,"directory full\n"); fclose(s); fclose(f); return 1; } }
 
     char tag[80]; snprintf(tag,sizeof tag,"mkfile %s",name);
     int jrn = (jopen(imgp,f,&g)==0);
@@ -822,7 +912,7 @@ static int cmd_mkfile(int argc, char **argv)
     /* build + write header cluster (object record + extent table) */
     uint8_t *hc=calloc(1,clu_bytes);
     uint64_t objid=((uint64_t)sec_to_ag(&g,hdr_sec)<<GFC_OBJID_LOCALBITS)|sec_to_localclu(&g,hdr_sec);
-    build_obj_header(hc,objid,OBJ_TYPE_FILE,0x03,(uint16_t)nd,0xFFFFFD00u,0,fsize,hdr_sec,data_clu,name);
+    build_obj_header(hc,objid,OBJ_TYPE_FILE,0x03,(uint16_t)nd,0xFFFFFD00u,0,fsize,hdr_sec,data_clu,leaf);
     for (int e=0;e<nd;e++){
         put_u64(hc+OBJ_HDR_BYTES+e*EXTENT_BYTES+EXT_StartSector,dext[e].start_sector);
         put_u64(hc+OBJ_HDR_BYTES+e*EXTENT_BYTES+EXT_ClusterCount,dext[e].cluster_count);
@@ -844,25 +934,8 @@ static int cmd_mkfile(int argc, char **argv)
       free(cl); }
     free(dext); fclose(s);
 
-    /* append directory entry to root (points at the header cluster) */
-    uint8_t *root=calloc(1,clu_bytes);
-    read_run(f,&g,ag_data_start(&g,0),1,root);
-    uint32_t nent=get_u32(root+OBJ_HDR_BYTES);
-    uint64_t root_cap=get_u64(root+OBJ_ClusterCount)*clu_bytes;
-    if (OBJ_HDR_BYTES+4+(uint64_t)(nent+1)*DIRENT_BYTES > root_cap){
-        fprintf(stderr,"root directory full (%u entries)\n",nent); free(root); fclose(f); return 1; }
-    uint8_t *de=root+OBJ_HDR_BYTES+4+(size_t)nent*DIRENT_BYTES;
-    memset(de,0,DIRENT_BYTES);
-    memset(de+DE_Name,' ',DE_NameLen);
-    { size_t n=strlen(name); if(n>DE_NameLen)n=DE_NameLen; memcpy(de+DE_Name,name,n); }
-    de[DE_Type]=OBJ_TYPE_FILE; de[DE_Attrs]=0x03;
-    put_u32(de+DE_Load,0xFFFFFD00u); put_u32(de+DE_Exec,0);
-    put_u64(de+DE_Length,fsize); put_u64(de+DE_StartSector,hdr_sec);
-    put_u32(root+OBJ_HDR_BYTES,nent+1);
-    put_u64(root+OBJ_Length,4+(uint64_t)(nent+1)*DIRENT_BYTES);
-    put_u32(root+OBJ_HdrCheck,sum_words(root,OBJ_HdrCheck));
-    write_run(f,&g,ag_data_start(&g,0),1,root);
-    free(root);
+    /* append directory entry in the parent dir (points at the header cluster) */
+    dir_add_entry(f,&g,parent,leaf,OBJ_TYPE_FILE,0xFFFFFD00u,0,fsize,hdr_sec);
     if (jrn){ jcommit(); jclose(); }
     fclose(f);
 
@@ -880,18 +953,11 @@ static int cmd_read(int argc, char **argv)
     if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
     uint32_t clu_bytes=1u<<g.log2_bpmb;
 
-    /* find the entry in root */
-    uint8_t *root=calloc(1,clu_bytes);
-    read_run(f,&g,ag_data_start(&g,0),1,root);
-    uint32_t nent=get_u32(root+OBJ_HDR_BYTES); uint64_t hdr_sec=0;
-    for (uint32_t e=0;e<nent;e++){
-        const uint8_t *de=root+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
-        char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
-        for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
-        if (!strcmp(nm,name)){ hdr_sec=get_u64(de+DE_StartSector); break; }
-    }
-    free(root);
-    if (!hdr_sec){ fprintf(stderr,"'%s' not found\n",name); fclose(f); return 1; }
+    /* resolve path -> parent dir -> entry */
+    char leaf[64]; uint64_t parent=resolve_parent(f,&g,name,leaf,sizeof leaf);
+    uint64_t hdr_sec=0; uint8_t ty=0;
+    if (!parent || !dir_find(f,&g,parent,leaf,&hdr_sec,&ty)){ fprintf(stderr,"'%s' not found\n",name); fclose(f); return 1; }
+    if (ty!=OBJ_TYPE_FILE){ fprintf(stderr,"'%s' is not a file\n",name); fclose(f); return 1; }
 
     /* header cluster -> extents -> data */
     uint8_t *hc=calloc(1,clu_bytes);
@@ -924,21 +990,27 @@ static int cmd_delete(int argc, char **argv)
     if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
     uint32_t clu_bytes=1u<<g.log2_bpmb;
 
-    /* find the entry */
-    uint8_t *root=calloc(1,clu_bytes);
-    read_run(f,&g,ag_data_start(&g,0),1,root);
-    uint32_t nent=get_u32(root+OBJ_HDR_BYTES); uint32_t idx=nent; uint64_t hdr_sec=0;
+    /* resolve path -> parent dir; find the entry index/type */
+    char leaf[64]; uint64_t parent=resolve_parent(f,&g,name,leaf,sizeof leaf);
+    if (!parent){ fprintf(stderr,"'%s' not found\n",name); fclose(f); return 1; }
+    uint8_t *dir=calloc(1,clu_bytes);
+    read_run(f,&g,parent,1,dir);
+    uint32_t nent=get_u32(dir+OBJ_HDR_BYTES); uint32_t idx=nent; uint64_t hdr_sec=0; uint8_t ty=0;
     for (uint32_t e=0;e<nent;e++){
-        const uint8_t *de=root+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        const uint8_t *de=dir+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
         char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
         for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
-        if (!strcmp(nm,name)){ idx=e; hdr_sec=get_u64(de+DE_StartSector); break; }
+        if (!strcmp(nm,leaf)){ idx=e; hdr_sec=get_u64(de+DE_StartSector); ty=de[DE_Type]; break; }
     }
-    if (idx==nent){ fprintf(stderr,"'%s' not found\n",name); free(root); fclose(f); return 1; }
+    if (idx==nent){ fprintf(stderr,"'%s' not found\n",name); free(dir); fclose(f); return 1; }
 
-    /* gather clusters to free: header + every extent cluster */
+    /* read the object; refuse to delete a non-empty directory */
     uint8_t *hc=calloc(1,clu_bytes);
     read_run(f,&g,hdr_sec,1,hc);
+    if (ty==OBJ_TYPE_DIR && get_u32(hc+OBJ_HDR_BYTES)!=0){
+        fprintf(stderr,"'%s' is a non-empty directory\n",name); free(hc); free(dir); fclose(f); return 1; }
+
+    /* gather clusters to free: header + every extent cluster */
     uint16_t nx=get_u16(hc+OBJ_ExtentCount);
     uint64_t cap=1+get_u64(hc+OBJ_ClusterCount), nf=0, *secs=malloc((cap+1)*sizeof*secs);
     secs[nf++]=hdr_sec;
@@ -949,22 +1021,55 @@ static int cmd_delete(int argc, char **argv)
     }
     free(hc);
 
-    /* journalled transaction: free clusters + remove dir entry */
+    /* journalled transaction: free clusters + remove the parent's entry */
     char tag[80]; snprintf(tag,sizeof tag,"delete %s",name);
     int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
     free_clusters(f,&g,secs,(int)nf);
-    /* compact the entry array */
-    uint8_t *base=root+OBJ_HDR_BYTES+4;
+    uint8_t *base=dir+OBJ_HDR_BYTES+4;
     memmove(base+(size_t)idx*DIRENT_BYTES, base+(size_t)(idx+1)*DIRENT_BYTES,
             (size_t)(nent-idx-1)*DIRENT_BYTES);
-    put_u32(root+OBJ_HDR_BYTES,nent-1);
-    put_u64(root+OBJ_Length,4+(uint64_t)(nent-1)*DIRENT_BYTES);
-    put_u32(root+OBJ_HdrCheck,sum_words(root,OBJ_HdrCheck));
-    write_run(f,&g,ag_data_start(&g,0),1,root);
+    put_u32(dir+OBJ_HDR_BYTES,nent-1);
+    put_u64(dir+OBJ_Length,4+(uint64_t)(nent-1)*DIRENT_BYTES);
+    put_u32(dir+OBJ_HdrCheck,sum_words(dir,OBJ_HdrCheck));
+    write_run(f,&g,parent,1,dir);
     if (jrn){ jcommit(); jclose(); }
-    free(secs); free(root); fclose(f);
+    free(secs); free(dir); fclose(f);
 
     printf("deleted '%s' (freed %llu cluster(s))\n",name,(unsigned long long)nf);
+    return 0;
+}
+
+static int cmd_mkdir(int argc, char **argv)
+{
+    if (argc<2){ fprintf(stderr,"usage: gfctool mkdir <image> <path>\n"); return 2; }
+    const char *imgp=argv[0], *path=argv[1];
+    FILE *f=fopen(imgp,"rb+"); if(!f){ perror("fopen image"); return 1; }
+    gfc_geom g; char err[128]; uint8_t sb[4096];
+    if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
+    uint32_t clu_bytes=1u<<g.log2_bpmb;
+
+    char leaf[64]; uint64_t parent=resolve_parent(f,&g,path,leaf,sizeof leaf);
+    if (!parent){ fprintf(stderr,"path not found: %s\n",path); fclose(f); return 1; }
+    if (dir_find(f,&g,parent,leaf,NULL,NULL)){ fprintf(stderr,"'%s' already exists\n",path); fclose(f); return 1; }
+    if (total_free_clusters(f,&g) < 1){ fprintf(stderr,"no free space\n"); fclose(f); return 1; }
+    { uint8_t *pd=calloc(1,clu_bytes); read_run(f,&g,parent,1,pd);
+      uint32_t pn=get_u32(pd+OBJ_HDR_BYTES); uint64_t cap=get_u64(pd+OBJ_ClusterCount)*clu_bytes; free(pd);
+      if (OBJ_HDR_BYTES+4+(uint64_t)(pn+1)*DIRENT_BYTES > cap){ fprintf(stderr,"parent directory full\n"); fclose(f); return 1; } }
+
+    char tag[80]; snprintf(tag,sizeof tag,"mkdir %s",path);
+    int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
+    extent_t he; int nh;
+    if (alloc_clusters(f,&g,1,&he,&nh,1)){ fprintf(stderr,"allocation failed\n"); fclose(f); return 1; }
+    uint8_t *dc=calloc(1,clu_bytes);
+    uint64_t objid=((uint64_t)sec_to_ag(&g,he.start_sector)<<GFC_OBJID_LOCALBITS)|sec_to_localclu(&g,he.start_sector);
+    build_obj_header(dc,objid,OBJ_TYPE_DIR,0x03,0,0,0,4,he.start_sector,1,leaf);
+    put_u32(dc+OBJ_HDR_BYTES,0);   /* EntryCount = 0 */
+    write_run(f,&g,he.start_sector,1,dc);
+    free(dc);
+    dir_add_entry(f,&g,parent,leaf,OBJ_TYPE_DIR,0,0,4,he.start_sector);
+    if (jrn){ jcommit(); jclose(); }
+    fclose(f);
+    printf("created directory '%s' at sector %llu\n",path,(unsigned long long)he.start_sector);
     return 0;
 }
 
@@ -976,9 +1081,10 @@ int main(int argc, char **argv)
           "usage:\n"
           "  gfctool format <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]\n"
           "  gfctool mkfile  <image> <name> <srcfile>\n"
-          "  gfctool read    <image> <name> <outfile>\n"
-          "  gfctool delete  <image> <name>\n"
-          "  gfctool ls      <image>\n"
+          "  gfctool read    <image> <path> <outfile>\n"
+          "  gfctool delete  <image> <path>\n"
+          "  gfctool mkdir   <image> <path>\n"
+          "  gfctool ls      <image> [path]\n"
           "  gfctool journal <image>\n"
           "  gfctool rewind  <image> [--to TXN]\n"
           "  gfctool check   <image>\n"
@@ -990,6 +1096,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1],"mkfile"))  return cmd_mkfile (argc-2,argv+2);
     if (!strcmp(argv[1],"read"))    return cmd_read   (argc-2,argv+2);
     if (!strcmp(argv[1],"delete"))  return cmd_delete (argc-2,argv+2);
+    if (!strcmp(argv[1],"mkdir"))   return cmd_mkdir  (argc-2,argv+2);
     if (!strcmp(argv[1],"ls"))      return cmd_ls     (argc-2,argv+2);
     if (!strcmp(argv[1],"journal")) return cmd_journal(argc-2,argv+2);
     if (!strcmp(argv[1],"rewind"))  return cmd_rewind (argc-2,argv+2);

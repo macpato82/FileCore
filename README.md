@@ -35,6 +35,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1b** | Object & directory model (`mkfile` / `ls`) | ✅ done |
 | **M1c** | Multi-extent, cross-AG files + `read` | ✅ done |
 | **M1d** | `delete` (cross-AG free + reuse, journalled) | ✅ done |
+| **M1e** | Subdirectories, paths (`mkdir`), recursive `check` | ✅ done |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables — implementation patch | ✅ drafted (build-unverified) |
@@ -82,6 +83,7 @@ tools/armcheck/ Host-side verifier for the ARM patch address arithmetic
 - [`design/06-M3a-DynamicDriveTables.md`](design/06-M3a-DynamicDriveTables.md) — M3a implementation patch (ARM).
 - [`design/07-M3bc-DriveNumberWidening.md`](design/07-M3bc-DriveNumberWidening.md) — M3b/M3c drive-number widening (ARM).
 - [`design/08-MultiExtent-CrossAG-v1.md`](design/08-MultiExtent-CrossAG-v1.md) — multi-extent, cross-AG files + `read`.
+- [`design/09-Directories-v1.md`](design/09-Directories-v1.md) — subdirectories, paths, recursive `check`.
 
 ## License
 
