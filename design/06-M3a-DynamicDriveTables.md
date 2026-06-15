@@ -129,7 +129,13 @@ first (or rely on the existing per-field init, which already writes every field)
 
 > The macro address arithmetic (§3) is **machine-verified** host-side by
 > [`tools/armcheck/macrocheck`](../tools/armcheck/README.md) — all branches compute
-> `base + index*SzRec` for indices 0..255. The items below still need an objasm/RPCEmu build.
+> `base + index*SzRec` for indices 0..255.
+>
+> **Phase 1 build-verified (2026): the pointerised macros assemble and link cleanly** with
+> objasm 4.13 in RPCEmu (RISC OS 5 / IOMD, APCS-32) — unmodified→patched FileCore both produce
+> `rm.IOMD.FileCore` with 0 errors. The verified diff is [`patches/m3a-phase1.diff`](../patches/m3a-phase1.diff).
+> Phase 1 keeps the static tables and only routes access through `DrvRecsPtr`/`DiscRecsPtr`
+> (behaviour-identical). Phase 2 (below) swaps the tables for a dynamically-claimed block.
 
 
 1. `objasm` builds clean for the default flag set (BigDisc+BigDir+BigShare+DynamicMaps ⇒ SzDiscRec=56,

@@ -43,7 +43,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1j** | Lazy AG init + global free counter (16 EB-class format) | ✅ done |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
-| **M3a** | Dynamic drive/disc record tables (ARM) | 🔨 implementing + build-verifying on RPCEmu |
+| **M3a** | Dynamic drive/disc record tables (ARM) | 🔨 phase 1 (pointerise) build-verified on RPCEmu; phase 2 next |
 | **M3b/c** | Drive-number widening (record index + address routing) | ✅ drafted (build pending) |
 | M4 | G-format read support in FileCore (ARM) | planned |
 | M5 | G-format write / allocation (ARM) | planned |
