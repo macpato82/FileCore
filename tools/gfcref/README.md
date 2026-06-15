@@ -32,6 +32,7 @@ gfctool journal <image>                     # list journal transactions
 gfctool rewind  <image> [--to TXN]          # undo last txn (or back to TXN)
 gfctool check   <image>
 gfctool info    <image>
+gfctool free    <image>                     # total/used/free + largest run
 ```
 Sizes accept `K/M/G/T/E` suffixes (powers of 1024). Defaults: 256 MiB image, 4096-byte
 sectors, 64 MiB allocation groups, cluster = sector size.

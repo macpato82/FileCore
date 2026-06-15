@@ -23,6 +23,7 @@ $img = Join-Path $wd "t.img"
 Write-Host "`n[1] format + info"
 Ok ((G format $img --size 1M --sector 512 --ag-size 64K) -eq 0) "format 1M/512/64K"
 Ok ((G info $img) -eq 0) "info"
+Ok ((G free $img) -eq 0) "free"
 Ok ((G check $img) -eq 0) "check empty"
 
 Write-Host "`n[2] small file round-trip"

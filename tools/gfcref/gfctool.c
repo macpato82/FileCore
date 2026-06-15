@@ -547,6 +547,32 @@ static int cmd_info(int argc, char **argv)
     fclose(f); return 0;
 }
 
+static int cmd_free(int argc, char **argv)
+{
+    if (argc<1){ fprintf(stderr,"usage: gfctool free <image>\n"); return 2; }
+    FILE *f=fopen(argv[0],"rb"); if(!f){ perror("fopen"); return 1; }
+    gfc_geom g; char err[128]; uint8_t sb[4096];
+    if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
+    uint64_t tot=0,fre=0,maxrun=0; uint8_t *h=malloc(g.sector_size);
+    for (uint64_t i=0;i<g.agcount;i++){
+        if (read_sector(f,&g,ag_header_sector(&g,i),h)) continue;
+        tot+=get_u64(h+AGH_ClustersTotal); fre+=get_u64(h+AGH_ClustersFree);
+        uint64_t lr=get_u64(h+AGH_LargestFreeRun); if(lr>maxrun) maxrun=lr;
+    }
+    free(h);
+    uint64_t cb=1u<<g.log2_bpmb, used=tot-fre;
+    printf("Free space for %s:\n", argv[0]);
+    printf("  cluster size     : %llu bytes\n",(unsigned long long)cb);
+    printf("  total            : %llu clusters (%.2f MiB)\n",(unsigned long long)tot,(double)tot*cb/1048576.0);
+    printf("  used             : %llu clusters (%.2f MiB)\n",(unsigned long long)used,(double)used*cb/1048576.0);
+    printf("  free             : %llu clusters (%.2f MiB, %.1f%%)\n",
+           (unsigned long long)fre,(double)fre*cb/1048576.0, tot?100.0*(double)fre/(double)tot:0.0);
+    printf("  largest free run : %llu clusters (%.2f MiB) in one AG\n",
+           (unsigned long long)maxrun,(double)maxrun*cb/1048576.0);
+    printf("  allocation groups: %llu\n",(unsigned long long)g.agcount);
+    fclose(f); return 0;
+}
+
 /* growable set of (AG, local cluster) pairs collected while walking the tree */
 typedef struct { uint64_t *ag; uint32_t *lc; uint64_t cap, M; } cluset;
 static void cluset_add(cluset *s, const gfc_geom *g, uint64_t sec){
@@ -1162,6 +1188,7 @@ int main(int argc, char **argv)
           "  gfctool rewind  <image> [--to TXN]\n"
           "  gfctool check   <image>\n"
           "  gfctool info    <image>\n"
+          "  gfctool free    <image>\n"
           "sizes accept K/M/G/T/E suffixes.\n");
         return 2;
     }
@@ -1176,6 +1203,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1],"rewind"))  return cmd_rewind (argc-2,argv+2);
     if (!strcmp(argv[1],"check"))   return cmd_check  (argc-2,argv+2);
     if (!strcmp(argv[1],"info"))    return cmd_info   (argc-2,argv+2);
+    if (!strcmp(argv[1],"free"))    return cmd_free   (argc-2,argv+2);
     fprintf(stderr,"unknown command: %s\n",argv[1]);
     return 2;
 }

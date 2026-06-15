@@ -38,6 +38,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1e** | Subdirectories, paths (`mkdir`), recursive `check` | ✅ done |
 | **M1f** | Regression + fragmentation + randomized stress suite | ✅ done (43 checks) |
 | **M1g** | `rename` / move (in-place + across dirs, journalled) | ✅ done |
+| **M1h** | `free` — space + fragmentation accounting | ✅ done |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables — implementation patch | ✅ drafted (build-unverified) |
