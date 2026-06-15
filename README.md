@@ -30,24 +30,49 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 
 | Milestone | Description | State |
 |---|---|---|
-| **M0** | Design specification + format reference | ✅ drafted |
-| M1 | C reference formatter + checker + sample images | planned |
-| M2 | Journaling hooks (register / service-call / txn) on existing E+ | planned |
+| **M0** | Design specification + format reference | ✅ done |
+| **M1** | C reference formatter + checker | ✅ done |
+| **M1b** | Object & directory model (`mkfile` / `ls`) | ✅ done |
+| **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | M3 | 256-drive internal support | planned |
-| M4 | G-format read support in FileCore | planned |
-| M5 | G-format write / allocation | planned |
+| M4 | G-format read support in FileCore (ARM) | planned |
+| M5 | G-format write / allocation (ARM) | planned |
 | M6 | Format/layout SWIs + ADFS/SCSIFS integration | planned |
-| M7 | Journaling wired to G-format metadata path | planned |
+| M7 | Journaling wired to G-format metadata path (ARM) | planned |
 
-M1–M3 can proceed in parallel; each delivers standalone value.
+The host-side reference (`tools/gfcref`) already formats G-format images, stores and lists
+files, integrity-checks the map against object extents, and journals/rewinds changes — all
+verified off-target before any ARM-assembler work begins.
+
+## Reference tool
+
+[`tools/gfcref`](tools/gfcref/README.md) — `gfctool`, a host-side formatter/checker:
+
+```
+gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
+gfctool mkfile  <image> <name> <srcfile>    # journalled
+gfctool ls      <image>
+gfctool journal <image>
+gfctool rewind  <image> [--to TXN]
+gfctool check   <image>
+gfctool info    <image>
+```
+
+`check` verifies the decisive invariant — allocated map bits == structural-reserved ∪ every
+object extent (no leaks/overlaps) — and `rewind` restores a byte-identical earlier disc state
+(confirmed by SHA-256). Build with `make` (gcc/MinGW).
 
 ## Layout
 
 ```
-design/   Design documents and format specifications
+design/         Design documents and format specifications
+tools/gfcref/   Host-side reference formatter / checker / journaller
 ```
 
-- [`design/01-NewDiscFormat-Spec.md`](design/01-NewDiscFormat-Spec.md) — full design spec (current draft).
+- [`design/01-NewDiscFormat-Spec.md`](design/01-NewDiscFormat-Spec.md) — design spec & decision.
+- [`design/02-GFormat-OnDisc-v1.md`](design/02-GFormat-OnDisc-v1.md) — byte-exact on-disc layout.
+- [`design/03-ObjectModel-v1.md`](design/03-ObjectModel-v1.md) — object & directory model.
+- [`design/04-Journaling-v1.md`](design/04-Journaling-v1.md) — journaling hooks (FileCore API + reference).
 
 ## License
 
