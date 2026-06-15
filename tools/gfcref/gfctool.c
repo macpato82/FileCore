@@ -506,20 +506,31 @@ fail:
     return 1;
 }
 
+/* read+validate a superblock copy at `lba` into sb; returns 0 if valid. */
+static int try_superblock(FILE *f, uint8_t *sb, uint64_t lba)
+{
+    uint8_t head[512];
+    if (gfc_fseek(f,lba*512,SEEK_SET)||fread(head,1,512,f)!=512) return -1;
+    uint32_t ss=1u<<head[SB_Log2SectorSize];
+    if (ss<512||ss>4096||!is_pow2_u64(ss)) return -1;
+    if (gfc_fseek(f,lba*ss,SEEK_SET)||fread(sb,1,ss,f)!=ss) return -1;
+    if (get_u32(sb+SB_GFC_MAGIC)!=GFC_SB_MAGIC) return -1;
+    if (get_u32(sb+ss-4)!=gfc_struct_check(sb,ss)) return -1;   /* checksum */
+    return 0;
+}
+
 /* ---- read SB and rebuild geometry for check/info ---- */
 static int load_geom(FILE *f, gfc_geom *g, uint8_t *sb, uint32_t sector_guess, char *err, size_t errsz)
 {
-    /* sector size lives at byte 0 (log2) - read first 512 to get it */
-    uint8_t head[512];
-    if (gfc_fseek(f,0,SEEK_SET)||fread(head,1,512,f)!=512){ snprintf(err,errsz,"cannot read header"); return -1; }
-    uint32_t ss = 1u<<head[SB_Log2SectorSize];
-    if (ss<512||ss>4096||!is_pow2_u64(ss)){ snprintf(err,errsz,"implausible sector size %u",ss); return -1; }
     (void)sector_guess;
-    if (gfc_fseek(f,0,SEEK_SET)||fread(sb,1,ss,f)!=ss){ snprintf(err,errsz,"short read of superblock"); return -1; }
-    if (get_u32(sb+SB_GFC_MAGIC)!=GFC_SB_MAGIC){ snprintf(err,errsz,"bad GFC magic (not a G-format image)"); return -1; }
-
+    /* primary @ sector 0; fall back to the secondary copy @ sector 1 (recovery) */
+    if (try_superblock(f,sb,0)!=0){
+        if (try_superblock(f,sb,1)!=0){ snprintf(err,errsz,"no valid superblock (primary and secondary both bad)"); return -1; }
+        fprintf(stderr,"warning: primary superblock bad - recovered from secondary copy\n");
+    }
+    uint32_t ss = 1u<<sb[SB_Log2SectorSize];
     uint64_t total_bytes = get_u64(sb+SB_TotalSectors) * ss;
-    uint32_t cluster = 1u << (head[SB_Log2SectorSize]+sb[SB_Log2SecsPerClu]);
+    uint32_t cluster = 1u << (sb[SB_Log2SectorSize]+sb[SB_Log2SecsPerClu]);
     uint32_t agsize_sectors = 1u<<sb[SB_Log2AGSize];
     if (compute_geom(total_bytes,ss,cluster,agsize_sectors,g,err,errsz)) return -1;
     return 0;
@@ -637,12 +648,13 @@ static int cmd_check(int argc, char **argv)
 
     if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"FAIL: %s\n",err); fclose(f); return 1; }
 
-    /* 1. superblock checksum + secondary copy */
-    if (get_u32(sb+g.sector_size-4)!=gfc_struct_check(sb,g.sector_size)) FAIL("superblock checksum");
-    { uint8_t *sb2=malloc(g.sector_size);
-      if (read_sector(f,&g,1,sb2)) FAIL("cannot read secondary superblock");
-      else if (memcmp(sb,sb2,g.sector_size)) FAIL("secondary superblock differs from primary");
-      free(sb2); }
+    /* 1. validate BOTH superblock copies independently (primary @0, secondary @1) */
+    { uint32_t ss=g.sector_size; uint8_t *p=malloc(ss), *s2=malloc(ss);
+      int pf=try_superblock(f,p,0), sf=try_superblock(f,s2,1);
+      if (pf) FAIL("primary superblock invalid (magic/checksum)");
+      if (sf) FAIL("secondary superblock invalid (magic/checksum)");
+      if (!pf && !sf && memcmp(p,s2,ss)) FAIL("primary and secondary superblocks differ");
+      free(p); free(s2); }
 
     /* 2. geometry vs image length */
     if (gfc_fseek(f,0,SEEK_END)==0){

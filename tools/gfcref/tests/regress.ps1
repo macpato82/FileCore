@@ -124,6 +124,16 @@ G mkfile $img4 b/exist.bin "$wd\r.bin" | Out-Null
 Ok ((G rename $img4 b/r3.bin b/exist.bin) -ne 0) "rename onto existing refused"
 Ok ((G check $img4) -eq 0) "check after renames"
 
+Write-Host "`n[11] superblock recovery (secondary copy)"
+$img5 = Join-Path $wd "sb.img"
+G format $img5 --size 256K --sector 512 --ag-size 64K | Out-Null
+MakeFile "$wd\sb.bin" 20000
+G mkfile $img5 f.bin "$wd\sb.bin" | Out-Null
+$bytes=[IO.File]::ReadAllBytes($img5); $bytes[64]=$bytes[64] -bxor 0xFF; [IO.File]::WriteAllBytes($img5,$bytes)  # wreck primary GFC magic
+G read $img5 f.bin "$wd\sb.out" | Out-Null
+Ok ((Hash "$wd\sb.bin") -eq (Hash "$wd\sb.out")) "data readable via secondary SB after primary corruption"
+Ok ((G check $img5) -ne 0) "check flags corrupt primary SB"
+
 Write-Host "`n================  $pass passed, $fail failed  ================"
 Remove-Item -Recurse -Force $wd
 if ($fail -gt 0) { exit 1 } else { exit 0 }
