@@ -22,7 +22,8 @@ Or directly: `gcc -std=c99 -O2 -Wall -o gfctool gfctool.c gfc_check.c`
 
 ```
 gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
-gfctool mkfile  <image> <name> <srcfile>   # journalled mutation
+gfctool mkfile  <image> <name> <srcfile>   # journalled; multi-extent, cross-AG
+gfctool read    <image> <name> <outfile>   # extract a file's contents
 gfctool ls      <image>
 gfctool journal <image>                     # list journal transactions
 gfctool rewind  <image> [--to TXN]          # undo last txn (or back to TXN)
@@ -80,11 +81,22 @@ state and `check` still passes; repeated `rewind` fully unwinds to the formatted
 - `gfc_check.c` — check-byte algorithms ported from the FileCore sources.
 - `gfctool.c` — geometry, `format`, `mkfile`, `ls`, `journal`, `rewind`, `check`, `info`.
 
+## Multi-extent & cross-AG (v1.1)
+
+Files are stored as a **header cluster** (object record + extent table) plus data clusters that
+may be **fragmented into multiple extents spanning different allocation groups** — the mechanism
+that scales the format past one AG (see [design/08](../../design/08-MultiExtent-CrossAG-v1.md)).
+`mkfile` allocates across all AGs (first-fit, one extent per run); `read` follows the extent table;
+`check` proves the per-AG map equals the union of every object's clusters across the whole disc.
+
+Verified: a 200 KB file on a disc of 128-cluster AGs lands in 4 extents across 4 AGs, `read`s back
+byte-identical (SHA-256), `check` passes, and `rewind` of that cross-AG write restores the
+formatted image byte-for-byte.
+
 ## Scope / v1 limitations
-- Objects are **single contiguous cluster runs** (one extent); fragmented / multi-extent
-  objects and sub-directory creation (`mkdir`) are a later milestone.
-- All user objects are allocated in **AG 0**; cross-AG allocation is later.
+- Sub-directory creation (`mkdir` / nested paths) is a later milestone; only the root directory.
 - Root directory is a single cluster (~100 entries at 4 KB); overflow reports "root full".
+- Allocation is first-fit (no best-fit / locality optimisation).
 - Per-AG allocation uses a **cluster bitmap + extents** model (see design/02 §3 and
   design/03), not the E+ fragment/free-chain; the production port may adopt either.
 - `check`/`mkfile` iterate AG 0 (and `check` every AG), so they are O(AG); `info` is O(1)

@@ -75,14 +75,20 @@
 #define OBJ_ObjId           4
 #define OBJ_Type            12
 #define OBJ_Attrs           13
+#define OBJ_ExtentCount     14   /* u16: data extents (0 for dirs) */
 #define OBJ_Load            16
 #define OBJ_Exec            20
 #define OBJ_Length          24
-#define OBJ_StartSector     32
-#define OBJ_ClusterCount    40
+#define OBJ_StartSector     32   /* this header cluster's own sector */
+#define OBJ_ClusterCount    40   /* total data clusters (= sum of extents) */
 #define OBJ_Name            48
 #define OBJ_NameLen         10
 #define OBJ_HdrCheck        60
+
+/* extent table follows the object record (files); 16 bytes each */
+#define EXTENT_BYTES        16
+#define EXT_StartSector     0
+#define EXT_ClusterCount    8
 
 /* ---- directory contents (follow the object record in a dir object) ---- */
 #define DIRENT_BYTES        40
