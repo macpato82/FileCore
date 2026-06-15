@@ -124,6 +124,19 @@ static uint32_t ag_first_data_cluster(const gfc_geom *g, uint64_t i){
     uint64_t span = ag_data_start(g,i) - ag_base(g,i);
     return (uint32_t)ceil_div(span, (uint64_t)1<<g->log2_secs_per_clu);
 }
+/* usable (object-holding) clusters in AG i: real clusters minus structural (header+map,
+ * SBs in AG0) minus the root cluster in AG0. */
+static uint64_t ag_usable(const gfc_geom *g, uint64_t i){
+    uint64_t real=ag_real_clusters(g,i), resv=ag_first_data_cluster(g,i)+(i==0?1:0);
+    return real>resv ? real-resv : 0;
+}
+/* total usable clusters disc-wide, computed analytically (O(1), works at 16 EB scale) */
+static uint64_t total_usable_clusters(const gfc_geom *g){
+    uint64_t n=g->agcount;
+    if (n==1) return ag_usable(g,0);
+    uint64_t full = (n>=2) ? (n-2) : 0;                 /* AGs 1..n-2 are full-size */
+    return ag_usable(g,0) + full*ag_usable(g,1) + ag_usable(g,n-1);
+}
 
 /* ---- map bit access ---- */
 static void map_set(uint8_t *map, const gfc_geom *g, uint32_t c){
@@ -220,7 +233,7 @@ static uint64_t localclu_to_sec(const gfc_geom *g, uint64_t ag, uint32_t lc){
 
 /* ---- superblock ---- */
 static void build_superblock(uint8_t *sb, const gfc_geom *g, uint64_t total_bytes,
-                             const char *name, uint32_t root_local)
+                             const char *name, uint32_t root_local, uint64_t usable, int lazy)
 {
     memset(sb,0,g->sector_size);
     sb[SB_Log2SectorSize]=g->log2_sector_size;
@@ -244,7 +257,9 @@ static void build_superblock(uint8_t *sb, const gfc_geom *g, uint64_t total_byte
     sb[SB_Log2AGSize]=g->log2_agsize;
     sb[SB_Log2SecSizeEcho]=g->log2_sector_size;
     put_u16(sb+SB_MapZones,g->map_zones);
-    put_u32(sb+SB_FeatureFlags,0);
+    put_u32(sb+SB_FeatureFlags, lazy?FEATURE_LAZY_AG:0);
+    put_u64(sb+SB_TotalClusters,usable);
+    put_u64(sb+SB_FreeClusters, usable?usable-1:0);   /* root consumes one usable cluster */
     sb[SB_ObjIdAGBits]=g->objid_ag_bits;
     sb[SB_ObjIdLocalBits]=GFC_OBJID_LOCALBITS;
     put_u64(sb+SB_RootObjId,(uint64_t)root_local);   /* AG 0 */
@@ -302,15 +317,32 @@ static void map_scan_free(const uint8_t *map, const gfc_geom *g, uint64_t real_c
     }
     *free_out=free; *largest_out=largest;
 }
-/* total free clusters across all AGs (excludes structural-reserved + root). */
+/* global free-cluster counter, from the superblock (O(1), scales to 16 EB) */
 static uint64_t total_free_clusters(FILE *f, const gfc_geom *g){
-    uint8_t *map=malloc((size_t)g->map_zones*g->sector_size);
-    uint64_t total=0;
-    for (uint64_t i=0;i<g->agcount;i++){
+    uint8_t *p=malloc(g->sector_size); read_sector(f,g,0,p);
+    uint64_t v=get_u64(p+SB_FreeClusters); free(p); return v;
+}
+/* adjust the global free-cluster counter in both superblock copies */
+static void sb_adjust_free(FILE *f, const gfc_geom *g, int64_t delta){
+    uint8_t *p=malloc(g->sector_size); read_sector(f,g,0,p);
+    put_u64(p+SB_FreeClusters, get_u64(p+SB_FreeClusters)+(uint64_t)delta);
+    put_u32(p+g->sector_size-4, gfc_struct_check(p,g->sector_size));
+    write_sector(f,g,0,p); write_sector(f,g,1,p);
+    free(p);
+}
+/* load AG i's map into `map`, lazily initialising the AG (header+reserved map) if needed */
+static void ag_init_map(FILE *f, const gfc_geom *g, uint64_t i, uint8_t *map){
+    uint8_t hdr[4096];
+    if (read_sector(f,g,ag_header_sector(g,i),hdr)==0 && get_u32(hdr+AGH_Magic)==GFC_AGH_MAGIC){
         for (uint16_t z=0;z<g->map_zones;z++) read_sector(f,g,ag_map_start(g,i)+z,map+(uint32_t)z*g->sector_size);
-        uint64_t fr,lg; map_scan_free(map,g,ag_real_clusters(g,i),&fr,&lg); total+=fr;
+        return;
     }
-    free(map); return total;
+    uint64_t cfree,ctot;
+    memset(map,0,(size_t)g->map_zones*g->sector_size);
+    ag_reserved_bits(map,g,i,(i==0),&cfree,&ctot);
+    map_finalise_checks(map,g);
+    { uint8_t *h=malloc(g->sector_size); build_ag_header(h,g,i,cfree,ctot); write_sector(f,g,ag_header_sector(g,i),h); free(h); }
+    for (uint16_t z=0;z<g->map_zones;z++) write_sector(f,g,ag_map_start(g,i)+z,map+(uint32_t)z*g->sector_size);
 }
 
 /* Allocate `need` clusters across AGs (first-fit), emitting one extent per
@@ -324,7 +356,7 @@ static int alloc_clusters(FILE *f, const gfc_geom *g, uint64_t need,
     for (uint64_t i=0;i<g->agcount && need>0;i++){
         uint64_t real=ag_real_clusters(g,i);
         uint32_t first=ag_first_data_cluster(g,i) + (i==0?1:0); /* skip root in AG0 */
-        for (uint16_t z=0;z<g->map_zones;z++) read_sector(f,g,ag_map_start(g,i)+z,map+(uint32_t)z*g->sector_size);
+        ag_init_map(f,g,i,map);                                /* read or lazily init */
         int touched=0;
         uint32_t c=first;
         while (c<real && need>0){
@@ -357,7 +389,7 @@ static void free_clusters(FILE *f, const gfc_geom *g, const uint64_t *secs, int 
     for (uint64_t i=0;i<g->agcount;i++){
         int touched=0;
         for (int j=0;j<n;j++) if (sec_to_ag(g,secs[j])==i){
-            if (!touched){ for (uint16_t z=0;z<g->map_zones;z++) read_sector(f,g,ag_map_start(g,i)+z,map+(uint32_t)z*g->sector_size); touched=1; }
+            if (!touched){ ag_init_map(f,g,i,map); touched=1; }
             map_clear(map,g,sec_to_localclu(g,secs[j]));
         }
         if (touched){
@@ -441,13 +473,14 @@ static int cmd_format(int argc, char **argv)
     const char *path=NULL, *name="GDisc";
     uint64_t total=256ull*1024*1024;
     uint32_t sector=4096, cluster=0, agsize_bytes=64u*1024*1024;
-    int i;
+    int i, lazy=0;
     for (i=0;i<argc;i++){
         if (!strcmp(argv[i],"--size") && i+1<argc){ if(parse_size(argv[++i],&total)){fprintf(stderr,"bad --size\n");return 2;} }
         else if(!strcmp(argv[i],"--sector")&&i+1<argc){ uint64_t v; if(parse_size(argv[++i],&v)){return 2;} sector=(uint32_t)v; }
         else if(!strcmp(argv[i],"--ag-size")&&i+1<argc){ uint64_t v; if(parse_size(argv[++i],&v)){return 2;} agsize_bytes=(uint32_t)v; }
         else if(!strcmp(argv[i],"--bpmb")&&i+1<argc){ uint64_t v; if(parse_size(argv[++i],&v)){return 2;} cluster=(uint32_t)v; }
         else if(!strcmp(argv[i],"--name")&&i+1<argc){ name=argv[++i]; }
+        else if(!strcmp(argv[i],"--lazy")){ lazy=1; }
         else if(argv[i][0]!='-' && !path){ path=argv[i]; }
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }
     }
@@ -460,6 +493,10 @@ static int cmd_format(int argc, char **argv)
     if (compute_geom(total,sector,cluster,agsize_sectors,&g,err,sizeof err)){
         fprintf(stderr,"geometry error: %s\n",err); return 2; }
 
+    /* auto-enable lazy AG init when there are too many AGs to write up front */
+    if (g.agcount > 65536) lazy=1;
+    uint64_t usable=total_usable_clusters(&g);
+
     FILE *f=fopen(path,"wb+");
     if (!f){ perror("fopen"); return 1; }
 
@@ -467,20 +504,22 @@ static int cmd_format(int argc, char **argv)
     uint32_t root_local=ag_first_data_cluster(&g,0);
 
     /* superblocks (primary @0, secondary @1) */
-    build_superblock(buf,&g,total,name,root_local);
+    build_superblock(buf,&g,total,name,root_local,usable,lazy);
     if (write_sector(f,&g,0,buf)||write_sector(f,&g,1,buf)){ perror("write sb"); goto fail; }
 
-    /* per-AG header + map */
+    /* per-AG header + map: all AGs eagerly, or just AG0 when lazy (rest on first use) */
     map=calloc(g.map_zones,sector);
-    for (uint64_t i=0;i<g.agcount;i++){
+    { uint64_t aglim = lazy ? 1 : g.agcount;
+      for (uint64_t i=0;i<aglim;i++){
         uint64_t cfree,ctot;
         memset(map,0,(size_t)g.map_zones*sector);
-        ag_reserved_bits(map,&g,i,1,&cfree,&ctot);
+        ag_reserved_bits(map,&g,i,(i==0),&cfree,&ctot);
         map_finalise_checks(map,&g);
         build_ag_header(buf,&g,i,cfree,ctot);
         if (write_sector(f,&g,ag_header_sector(&g,i),buf)){ perror("write agh"); goto fail; }
         for (uint16_t z=0; z<g.map_zones; z++)
             if (write_sector(f,&g,ag_map_start(&g,i)+z,map+(uint32_t)z*sector)){ perror("write map"); goto fail; }
+      }
     }
 
     /* root directory object in AG0 first data cluster */
@@ -493,12 +532,13 @@ static int cmd_format(int argc, char **argv)
         free(cl);
     }
 
-    /* ensure the image is exactly TotalSectors long */
-    if (gfc_fseek(f, g.total_sectors*sector - 1, SEEK_SET)==0){ uint8_t z=0; fwrite(&z,1,1,f); }
+    /* eager mode materialises the full image; lazy leaves it sparse/short */
+    if (!lazy && gfc_fseek(f, g.total_sectors*sector - 1, SEEK_SET)==0){ uint8_t z=0; fwrite(&z,1,1,f); }
 
     fclose(f); free(buf); free(map);
-    printf("Formatted %s: %.2f MiB, %llu AGs, sector %u, cluster %u, %u map-zone(s)/AG\n",
-           path,(double)total/1048576.0,(unsigned long long)g.agcount,sector,cluster,g.map_zones);
+    printf("Formatted %s: %llu AGs, sector %u, cluster %u, %u map-zone(s)/AG%s; usable %llu clusters\n",
+           path,(unsigned long long)g.agcount,sector,cluster,g.map_zones,
+           lazy?" [lazy]":"",(unsigned long long)usable);
     return 0;
 fail:
     if(f) fclose(f);
@@ -509,8 +549,10 @@ fail:
 /* read+validate a superblock copy at `lba` into sb; returns 0 if valid. */
 static int try_superblock(FILE *f, uint8_t *sb, uint64_t lba)
 {
+    /* sector size lives at byte 0 of the primary (offset 0) - the one position-independent
+     * field; both copies are ss-aligned at lba*ss. */
     uint8_t head[512];
-    if (gfc_fseek(f,lba*512,SEEK_SET)||fread(head,1,512,f)!=512) return -1;
+    if (gfc_fseek(f,0,SEEK_SET)||fread(head,1,512,f)!=512) return -1;
     uint32_t ss=1u<<head[SB_Log2SectorSize];
     if (ss<512||ss>4096||!is_pow2_u64(ss)) return -1;
     if (gfc_fseek(f,lba*ss,SEEK_SET)||fread(sb,1,ss,f)!=ss) return -1;
@@ -564,23 +606,16 @@ static int cmd_free(int argc, char **argv)
     FILE *f=fopen(argv[0],"rb"); if(!f){ perror("fopen"); return 1; }
     gfc_geom g; char err[128]; uint8_t sb[4096];
     if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
-    uint64_t tot=0,fre=0,maxrun=0; uint8_t *h=malloc(g.sector_size);
-    for (uint64_t i=0;i<g.agcount;i++){
-        if (read_sector(f,&g,ag_header_sector(&g,i),h)) continue;
-        tot+=get_u64(h+AGH_ClustersTotal); fre+=get_u64(h+AGH_ClustersFree);
-        uint64_t lr=get_u64(h+AGH_LargestFreeRun); if(lr>maxrun) maxrun=lr;
-    }
-    free(h);
-    uint64_t cb=1u<<g.log2_bpmb, used=tot-fre;
+    uint64_t tot=get_u64(sb+SB_TotalClusters), fre=get_u64(sb+SB_FreeClusters), used=tot-fre;
+    double cb=(double)(1u<<g.log2_bpmb);
     printf("Free space for %s:\n", argv[0]);
-    printf("  cluster size     : %llu bytes\n",(unsigned long long)cb);
-    printf("  total            : %llu clusters (%.2f MiB)\n",(unsigned long long)tot,(double)tot*cb/1048576.0);
-    printf("  used             : %llu clusters (%.2f MiB)\n",(unsigned long long)used,(double)used*cb/1048576.0);
-    printf("  free             : %llu clusters (%.2f MiB, %.1f%%)\n",
-           (unsigned long long)fre,(double)fre*cb/1048576.0, tot?100.0*(double)fre/(double)tot:0.0);
-    printf("  largest free run : %llu clusters (%.2f MiB) in one AG\n",
-           (unsigned long long)maxrun,(double)maxrun*cb/1048576.0);
-    printf("  allocation groups: %llu\n",(unsigned long long)g.agcount);
+    printf("  cluster size     : %.0f bytes\n", cb);
+    printf("  usable total     : %llu clusters (%.2f GiB)\n",(unsigned long long)tot,(double)tot*cb/1073741824.0);
+    printf("  used             : %llu clusters (%.2f GiB)\n",(unsigned long long)used,(double)used*cb/1073741824.0);
+    printf("  free             : %llu clusters (%.2f GiB, %.1f%%)\n",
+           (unsigned long long)fre,(double)fre*cb/1073741824.0, tot?100.0*(double)fre/(double)tot:0.0);
+    printf("  allocation groups: %llu%s\n",(unsigned long long)g.agcount,
+           (get_u32(sb+SB_FeatureFlags)&FEATURE_LAZY_AG)?" [lazy AG init]":"");
     fclose(f); return 0;
 }
 
@@ -638,6 +673,9 @@ static int collect_tree(FILE *f, const gfc_geom *g, uint64_t dir_sec, cluset *s,
 #undef CFAIL
 
 #define FAIL(...) do{ fprintf(stderr,"FAIL: "); fprintf(stderr,__VA_ARGS__); fprintf(stderr,"\n"); nerr++; }while(0)
+static int cmp_u64(const void *a, const void *b){
+    uint64_t x=*(const uint64_t*)a, y=*(const uint64_t*)b; return (x>y)-(x<y);
+}
 
 static int cmd_check(int argc, char **argv)
 {
@@ -656,8 +694,10 @@ static int cmd_check(int argc, char **argv)
       if (!pf && !sf && memcmp(p,s2,ss)) FAIL("primary and secondary superblocks differ");
       free(p); free(s2); }
 
-    /* 2. geometry vs image length */
-    if (gfc_fseek(f,0,SEEK_END)==0){
+    int lazy = (get_u32(sb+SB_FeatureFlags)&FEATURE_LAZY_AG)!=0;
+
+    /* 2. geometry vs image length (eager only; lazy images are sparse/short) */
+    if (!lazy && gfc_fseek(f,0,SEEK_END)==0){
         uint64_t len=(uint64_t)gfc_ftell(f);
         if (len != g.total_sectors*g.sector_size) FAIL("image length %llu != TotalSectors*sector %llu",
             (unsigned long long)len,(unsigned long long)(g.total_sectors*g.sector_size));
@@ -670,10 +710,23 @@ static int cmd_check(int argc, char **argv)
     cluset S; S.cap=64; S.M=0; S.ag=malloc(S.cap*sizeof*S.ag); S.lc=malloc(S.cap*sizeof*S.lc);
     nerr += collect_tree(f,&g,ag_data_start(&g,0),&S,0);
 
-    /* 4. each AG header + map, with collected object clusters applied to its AG */
+    /* 3b. global free-space counter consistency (free = usable - objects - root) */
+    uint64_t usable=total_usable_clusters(&g);
+    if (get_u64(sb+SB_TotalClusters)!=usable) FAIL("TotalClusters %llu != computed usable %llu",
+        (unsigned long long)get_u64(sb+SB_TotalClusters),(unsigned long long)usable);
+    if (get_u64(sb+SB_FreeClusters)+S.M+1 != usable) FAIL("FreeClusters %llu inconsistent (usable %llu, allocated %llu)",
+        (unsigned long long)get_u64(sb+SB_FreeClusters),(unsigned long long)usable,(unsigned long long)(S.M+1));
+
+    /* 4. validate AG0 + every AG that owns an object cluster (O(used AGs); scales to 16 EB) */
+    uint64_t *uag=malloc((S.M+1)*sizeof*uag), U=0; uag[U++]=0;
+    for (uint64_t m=0;m<S.M;m++) uag[U++]=S.ag[m];
+    qsort(uag,U,sizeof*uag,cmp_u64);
+    { uint64_t W=0; for(uint64_t m=0;m<U;m++) if(W==0||uag[m]!=uag[W-1]) uag[W++]=uag[m]; U=W; }
+
     uint8_t *h=malloc(g.sector_size), *map=malloc((size_t)g.map_zones*g.sector_size);
     uint8_t *exp=malloc((size_t)g.map_zones*g.sector_size);
-    for (uint64_t i=0;i<g.agcount && nerr<50;i++){
+    for (uint64_t ui=0; ui<U && nerr<50; ui++){
+        uint64_t i=uag[ui];
         if (read_sector(f,&g,ag_header_sector(&g,i),h)){ FAIL("read AG %llu header",(unsigned long long)i); continue; }
         if (get_u32(h+AGH_Magic)!=GFC_AGH_MAGIC) FAIL("AG %llu bad magic",(unsigned long long)i);
         if (get_u64(h+AGH_AGNumber)!=i) FAIL("AG %llu number field wrong",(unsigned long long)i);
@@ -701,12 +754,12 @@ static int cmd_check(int argc, char **argv)
             (unsigned long long)i,(unsigned long long)get_u64(h+AGH_ClustersFree),(unsigned long long)cfree);
         if (get_u64(h+AGH_ClustersTotal)!=ctot) FAIL("AG %llu ClustersTotal mismatch",(unsigned long long)i);
     }
-    free(h); free(map); free(exp); free(S.ag); free(S.lc);
+    free(uag); free(h); free(map); free(exp); free(S.ag); free(S.lc);
 
     fclose(f);
     if (nerr){ printf("CHECK FAILED: %d error(s)\n",nerr); return 1; }
-    printf("CHECK OK: %llu AGs, %llu sectors, all structures consistent\n",
-           (unsigned long long)g.agcount,(unsigned long long)g.total_sectors);
+    printf("CHECK OK: %llu AGs%s, %llu sectors, all structures consistent\n",
+           (unsigned long long)g.agcount, lazy?" [lazy]":"", (unsigned long long)g.total_sectors);
     return 0;
 }
 
@@ -974,6 +1027,7 @@ static int cmd_mkfile(int argc, char **argv)
 
     /* append directory entry in the parent dir (points at the header cluster) */
     dir_add_entry(f,&g,parent,leaf,OBJ_TYPE_FILE,0xFFFFFD00u,0,fsize,hdr_sec);
+    sb_adjust_free(f,&g,-(int64_t)(1+data_clu));     /* header + data clusters consumed */
     if (jrn){ jcommit(); jclose(); }
     fclose(f);
 
@@ -1063,6 +1117,7 @@ static int cmd_delete(int argc, char **argv)
     char tag[80]; snprintf(tag,sizeof tag,"delete %s",name);
     int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
     free_clusters(f,&g,secs,(int)nf);
+    sb_adjust_free(f,&g,(int64_t)nf);                 /* clusters returned to free space */
     uint8_t *base=dir+OBJ_HDR_BYTES+4;
     memmove(base+(size_t)idx*DIRENT_BYTES, base+(size_t)(idx+1)*DIRENT_BYTES,
             (size_t)(nent-idx-1)*DIRENT_BYTES);
@@ -1105,6 +1160,7 @@ static int cmd_mkdir(int argc, char **argv)
     write_run(f,&g,he.start_sector,1,dc);
     free(dc);
     dir_add_entry(f,&g,parent,leaf,OBJ_TYPE_DIR,0,0,4,he.start_sector);
+    sb_adjust_free(f,&g,-1);                          /* one cluster for the directory */
     if (jrn){ jcommit(); jclose(); }
     fclose(f);
     printf("created directory '%s' at sector %llu\n",path,(unsigned long long)he.start_sector);
@@ -1189,7 +1245,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
           "gfctool - FileCore G-format reference (bounty #40)\n"
           "usage:\n"
-          "  gfctool format <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]\n"
+          "  gfctool format <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR] [--lazy]\n"
           "  gfctool mkfile  <image> <name> <srcfile>\n"
           "  gfctool read    <image> <path> <outfile>\n"
           "  gfctool delete  <image> <path>\n"

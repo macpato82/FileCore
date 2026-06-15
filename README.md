@@ -36,10 +36,11 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1c** | Multi-extent, cross-AG files + `read` | ✅ done |
 | **M1d** | `delete` (cross-AG free + reuse, journalled) | ✅ done |
 | **M1e** | Subdirectories, paths (`mkdir`), recursive `check` | ✅ done |
-| **M1f** | Regression + fragmentation + randomized stress suite | ✅ done (46 checks) |
+| **M1f** | Regression + fragmentation + randomized stress suite | ✅ done (53 checks) |
 | **M1g** | `rename` / move (in-place + across dirs, journalled) | ✅ done |
 | **M1h** | `free` — space + fragmentation accounting | ✅ done |
 | **M1i** | Superblock recovery from secondary copy | ✅ done |
+| **M1j** | Lazy AG init + global free counter (16 EB-class format) | ✅ done |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables — implementation patch | ✅ drafted (build-unverified) |
@@ -95,6 +96,7 @@ tools/armcheck/ Host-side verifier for the ARM patch address arithmetic
 - [`design/07-M3bc-DriveNumberWidening.md`](design/07-M3bc-DriveNumberWidening.md) — M3b/M3c drive-number widening (ARM).
 - [`design/08-MultiExtent-CrossAG-v1.md`](design/08-MultiExtent-CrossAG-v1.md) — multi-extent, cross-AG files + `read`.
 - [`design/09-Directories-v1.md`](design/09-Directories-v1.md) — subdirectories, paths, recursive `check`.
+- [`design/10-LazyAG-v1.md`](design/10-LazyAG-v1.md) — lazy AG init + global free counter (16 EB-class).
 
 ## License
 

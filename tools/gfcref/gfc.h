@@ -51,7 +51,12 @@
 #define SB_DataStartInAG    108
 #define SB_ClustersPerAG    112
 #define SB_Log2SecsPerClu   116
+#define SB_TotalClusters    120   /* u64: total usable (object) clusters disc-wide */
+#define SB_FreeClusters     128   /* u64: currently-free usable clusters (global counter) */
 #define SB_DiscNameLen      10
+
+/* FeatureFlags bits (SB_FeatureFlags) */
+#define FEATURE_LAZY_AG     1     /* AGs initialised on first use; not all written at format */
 
 /* ---- AG header field offsets ---- */
 #define AGH_Magic           0

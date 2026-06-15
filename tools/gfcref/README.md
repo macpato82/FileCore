@@ -21,7 +21,7 @@ Or directly: `gcc -std=c99 -O2 -Wall -o gfctool gfctool.c gfc_check.c`
 ## Usage
 
 ```
-gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
+gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR] [--lazy]
 gfctool mkfile  <image> <path> <srcfile>   # journalled; multi-extent, cross-AG
 gfctool read    <image> <path> <outfile>   # extract a file's contents
 gfctool delete  <image> <path>              # journalled; frees clusters; rmdir if empty
@@ -113,6 +113,20 @@ Full directory tree (`mkdir`, nested paths); see [design/09](../../design/09-Dir
 Paths use `/` (maps to RISC OS `.`). `check` walks the whole tree and proves each AG's map equals
 the union of reserved clusters and every object's clusters (sub-dirs, file headers, all extents) —
 no leaks/overlaps disc-wide. `delete` of a directory is refused unless empty (rmdir).
+
+## Large discs / lazy AG init (v1.3)
+
+At 16 EB scale you can't write metadata for every allocation group up front, so `format` writes
+only the superblocks + AG 0 (auto when `AGCount > 65536`, or `--lazy`); other AGs are initialised
+on first use. A global free-cluster counter in the superblock keeps `free` O(1). See
+[design/10](../../design/10-LazyAG-v1.md).
+
+```
+$ gfctool format huge.img --size 8E      # 8 EiB: instant, ~20 KB host file
+Formatted huge.img: 137438953472 AGs, ... [lazy]; usable 2251524935778301 clusters
+$ gfctool check huge.img                  # O(used AGs)
+CHECK OK: 137438953472 AGs [lazy], 2251799813685248 sectors, all structures consistent
+```
 
 ## Scope / v1 limitations
 - Directories are single-cluster (~100 entries at 4 KB); overflow reports "directory full".

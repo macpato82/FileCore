@@ -134,6 +134,22 @@ G read $img5 f.bin "$wd\sb.out" | Out-Null
 Ok ((Hash "$wd\sb.bin") -eq (Hash "$wd\sb.out")) "data readable via secondary SB after primary corruption"
 Ok ((G check $img5) -ne 0) "check flags corrupt primary SB"
 
+Write-Host "`n[12] lazy AG init (16 EB-class + on-demand spill)"
+$imgL = Join-Path $wd "lazy.img"
+Ok ((G format $imgL --size 8E) -eq 0) "format 8 EiB (auto-lazy)"
+Ok ((Get-Item $imgL).Length -lt 1MB) "8 EiB host image is tiny (lazy, not materialised)"
+Ok ((G check $imgL) -eq 0) "check 8 EiB"
+MakeFile "$wd\h.bin" 30000
+Ok ((G mkfile $imgL f.bin "$wd\h.bin") -eq 0) "mkfile on 8 EiB disc"
+Ok ((G check $imgL) -eq 0) "check 8 EiB after file"
+$imgS = Join-Path $wd "spill.img"
+G format $imgS --size 512K --sector 512 --ag-size 32K --lazy | Out-Null
+MakeFile "$wd\sp.bin" 100000
+G mkfile $imgS big.bin "$wd\sp.bin" | Out-Null
+G read $imgS big.bin "$wd\sp.out" | Out-Null
+Ok ((Hash "$wd\sp.bin") -eq (Hash "$wd\sp.out")) "lazy spill across on-demand AGs reads identical"
+Ok ((G check $imgS) -eq 0) "check lazy spill"
+
 Write-Host "`n================  $pass passed, $fail failed  ================"
 Remove-Item -Recurse -Force $wd
 if ($fail -gt 0) { exit 1 } else { exit 0 }
