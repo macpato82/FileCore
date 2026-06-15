@@ -146,7 +146,7 @@ diff --git "a/Sources/FileSys/FileCore/s/InitDieSvc" "b/Sources/FileSys/FileCore
 index ee0266b..195fbf5 100644
 --- "a/Sources/FileSys/FileCore/s/InitDieSvc"
 +++ "b/Sources/FileSys/FileCore/s/InitDieSvc"
-@@ -339,8 +339,17 @@ InitEntry ROUT          ; NO REENTRANCY CHECK NEEDED
+@@ -339,8 +339,23 @@ InitEntry ROUT          ; NO REENTRANCY CHECK NEEDED
          BL      UnlockDirCache
  
  ;initialise Drive & disc records, ptrs to Free space Maps and defect lists
@@ -154,9 +154,15 @@ index ee0266b..195fbf5 100644
 -        sbaddr  R5, DiscRecs
 +        ; M3a phase 2: claim the drive + disc record tables as one RMA block
 +        ; (sized for MaxDrives), lifting them out of the <&1000 static workspace.
++        ; The surrounding init keeps live registers across here - notably R7/R8
++        ; (the floppy/winnie drive-existence bounds used by the loop below) - and
++        ; OS_Module trashes them, so preserve them across the SWI. (Without this,
++        ; every drive was marked non-existent and mounts failed as BadDrive.)
++        Push    "R1, R3, R6, R7, R8, R9, R10, LR"
 +        MOV     R3, #MaxDrives*(SzDrvRec+SzDiscRec)
 +        MOV     R0, #ModHandReason_Claim
 +        SWI     XOS_Module
++        Pull    "R1, R3, R6, R7, R8, R9, R10, LR" ; LDM preserves V from the SWI
 +        BVS     %FT95                   ; propagate claim failure (as for workspace)
 +        STR     R2, DrvRecsPtr          ; drive records first
 +        ADD     R4, R2, #MaxDrives*SzDrvRec
@@ -166,7 +172,7 @@ index ee0266b..195fbf5 100644
          ASSERT  SzDefectList=&200
  
          MOV     R2, #0          ;ctr
-@@ -699,6 +708,13 @@ DieEntry
+@@ -699,6 +714,13 @@ DieEntry
          ADRNE   R0, message_file_block
          SWINE   XMessageTrans_CloseFile ; Ignore error from this
  

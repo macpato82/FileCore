@@ -1,7 +1,8 @@
 # M3 ARM work-in-progress (build + RUNTIME verified on RPCEmu/RO5 via softload).
-# = M3a (dynamic record tables, complete) + M3b.0 (Drive Record grown to 40 for the
-#   future full-width disc-record index byte; DrvRecPtr macro x40). M3b.1 (migrate the
-#   number into DrvsDiscNum + rework the <8 disambiguation) is still pending.
+# = M3a (dynamic record tables, complete; incl. the register-preservation fix so
+#   mounts work - R7/R8 preserved across the OS_Module claim) + M3b.0 (Drive Record
+#   grown to 40 for the future full-width disc-record index; DrvRecPtr x40).
+#   Verified: floppy mount + file copy work on the patched FileCore. M3b.1 pending.
 diff --git "a/Sources/FileSys/FileCore/s/Defns" "b/Sources/FileSys/FileCore/s/Defns"
 index 98df71c..7041081 100644
 --- "a/Sources/FileSys/FileCore/s/Defns"
@@ -158,10 +159,10 @@ index 24e9964..eba8fad 100644
  
  
 diff --git "a/Sources/FileSys/FileCore/s/InitDieSvc" "b/Sources/FileSys/FileCore/s/InitDieSvc"
-index ee0266b..195fbf5 100644
+index ee0266b..0f4bcd5 100644
 --- "a/Sources/FileSys/FileCore/s/InitDieSvc"
 +++ "b/Sources/FileSys/FileCore/s/InitDieSvc"
-@@ -339,8 +339,17 @@ InitEntry ROUT          ; NO REENTRANCY CHECK NEEDED
+@@ -339,8 +339,23 @@ InitEntry ROUT          ; NO REENTRANCY CHECK NEEDED
          BL      UnlockDirCache
  
  ;initialise Drive & disc records, ptrs to Free space Maps and defect lists
@@ -169,9 +170,15 @@ index ee0266b..195fbf5 100644
 -        sbaddr  R5, DiscRecs
 +        ; M3a phase 2: claim the drive + disc record tables as one RMA block
 +        ; (sized for MaxDrives), lifting them out of the <&1000 static workspace.
++        ; The surrounding init keeps live registers across here - notably R7/R8
++        ; (the floppy/winnie drive-existence bounds used by the loop below) - and
++        ; OS_Module trashes them, so preserve them across the SWI. (Without this,
++        ; every drive was marked non-existent and mounts failed as BadDrive.)
++        Push    "R1, R3, R6, R7, R8, R9, R10, LR"
 +        MOV     R3, #MaxDrives*(SzDrvRec+SzDiscRec)
 +        MOV     R0, #ModHandReason_Claim
 +        SWI     XOS_Module
++        Pull    "R1, R3, R6, R7, R8, R9, R10, LR" ; LDM preserves V from the SWI
 +        BVS     %FT95                   ; propagate claim failure (as for workspace)
 +        STR     R2, DrvRecsPtr          ; drive records first
 +        ADD     R4, R2, #MaxDrives*SzDrvRec
@@ -181,7 +188,7 @@ index ee0266b..195fbf5 100644
          ASSERT  SzDefectList=&200
  
          MOV     R2, #0          ;ctr
-@@ -699,6 +708,13 @@ DieEntry
+@@ -699,6 +714,13 @@ DieEntry
          ADRNE   R0, message_file_block
          SWINE   XMessageTrans_CloseFile ; Ignore error from this
  

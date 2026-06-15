@@ -43,7 +43,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1j** | Lazy AG init + global free counter (16 EB-class format) | ✅ done |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
-| **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build- **and runtime**-verified on RPCEmu |
+| **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build- **and runtime**-verified on RPCEmu (mount + file copy on a real disc) |
 | **M3b** | Drive-number widening (DrvsDisc index) | 🔨 phase b.0 (record→40, ×40 macro) build+runtime-verified; b.1 (migrate number + rework `<8` disambiguation) pending |
 | **M3c** | DiscOp64 drive routing in GenIndDiscOp | ✅ drafted (design/07) |
 | M4 | G-format read support in FileCore (ARM) | planned |
@@ -60,8 +60,10 @@ source in RPCEmu using the Acorn DDE (RISC OS 5 / IOMD, APCS-32) — to `rm.IOMD
 softloadable `rm.IOMD.FileCoreSA`. **M3a** (dynamic drive/disc record tables: pointerised access,
 then an `OS_Module`-claimed RMA block freed on Die — [`patches/m3a.diff`](patches/m3a.diff))
 assembles + links with 0 errors **and runs**: softloaded over the ROM FileCore in a live RISC OS,
-ADFS re-creates its instance and `FileCore_Create` runs the new record-table claim/init cleanly
-with the desktop still up. **M3b** is underway: phase b.0 (Drive Record grown to 40 bytes for a future full-width
+a 1600K ADFS floppy **mounts and copies files**. (Runtime testing earned its keep here: assemble +
+ADFS-init looked green, but a real mount exposed a register-corruption bug — the `OS_Module` claim
+trashed `R7`/`R8`, the floppy/winnie drive-existence bounds the init loop relies on, so every drive
+was marked absent and mounts failed `BadDrive`. Fixed by preserving them across the SWI.) **M3b** is underway: phase b.0 (Drive Record grown to 40 bytes for a future full-width
 disc-record index, `DrvRecPtr` ×40) is build+runtime-verified; phase b.1 (migrate the index out
 of the overloaded `DrvsDisc` byte — record-number XOR flag-state disambiguated by `< 8` — and
 rework that disambiguation) is paused at a checkpoint. b.1's "has-record" path wants a *mounted*
