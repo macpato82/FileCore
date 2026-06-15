@@ -25,6 +25,24 @@
   #define gfc_ftell(f)       ftello(f)
 #endif
 
+/* ---- journaling (host-side reference of the FileCore hooks) ---- */
+#define JRNL_MAGIC 0x4A434647u   /* "GFCJ" */
+#define JREC_MAGIC 0x4345524Au   /* "JREC" */
+#define JREC_BEGIN 0
+#define JREC_COMMIT 1
+#define JREC_WRITE 2
+#define JREC_HDR_BYTES 24
+typedef struct {
+    FILE *jf;            /* sidecar journal file */
+    FILE *imgf;          /* image being journalled */
+    const void *g;       /* gfc_geom* */
+    uint64_t txn, seq;
+    uint8_t  drive;
+    int active;
+} journal_t;
+static journal_t J = {0};
+static void jcapture_before(FILE *f, const void *g, uint64_t sec);  /* fwd */
+
 static int is_pow2_u64(uint64_t v){ return v && (v & (v-1))==0; }
 static uint8_t log2_u64(uint64_t v){ uint8_t n=0; while(v>1){v>>=1;n++;} return n; }
 static uint64_t ceil_div(uint64_t a, uint64_t b){ return (a + b - 1) / b; }
@@ -239,6 +257,7 @@ static void build_ag_header(uint8_t *h, const gfc_geom *g, uint64_t i,
 
 /* ---- low-level image IO ---- */
 static int write_sector(FILE *f, const gfc_geom *g, uint64_t sec, const uint8_t *buf){
+    if (J.active && f==J.imgf) jcapture_before(f,g,sec);   /* journal before-image */
     if (gfc_fseek(f, sec*g->sector_size, SEEK_SET)) return -1;
     return fwrite(buf,g->sector_size,1,f)==1 ? 0 : -1;
 }
@@ -489,6 +508,181 @@ static int cmd_check(int argc, char **argv)
     return 0;
 }
 
+/* ====================================================================== */
+/* journaling: sidecar ‹image›.gfcjrnl, mirrors the FileCore hook semantics */
+
+static void jrec_common(uint8_t type){
+    uint8_t h[JREC_HDR_BYTES]; memset(h,0,sizeof h);
+    put_u32(h+0,JREC_MAGIC); put_u64(h+4,J.seq); put_u64(h+12,J.txn);
+    h[20]=type; h[21]=J.drive;
+    fwrite(h,JREC_HDR_BYTES,1,J.jf);
+    J.seq++;
+}
+static void jcapture_before(FILE *f, const void *gv, uint64_t sec){
+    const gfc_geom *g=gv;
+    uint8_t *bi=malloc(g->sector_size);
+    if (read_sector(f,g,sec,bi)) memset(bi,0,g->sector_size);
+    jrec_common(JREC_WRITE);
+    { uint8_t t[12]; put_u64(t,sec); put_u32(t+8,1); fwrite(t,12,1,J.jf); }
+    fwrite(bi,g->sector_size,1,J.jf);
+    free(bi);
+}
+static char *jpath(const char *imgpath){
+    char *p=malloc(strlen(imgpath)+10); sprintf(p,"%s.gfcjrnl",imgpath); return p;
+}
+static int jopen(const char *imgpath, FILE *imgf, const gfc_geom *g){
+    char *jp=jpath(imgpath);
+    FILE *jf=fopen(jp,"rb+"); free(jp);
+    uint64_t next_seq=1;
+    if (jf){
+        uint8_t hd[32];
+        if (fread(hd,1,32,jf)!=32 || get_u32(hd)!=JRNL_MAGIC ||
+            get_u32(hd+8)!=g->sector_size || get_u64(hd+12)!=g->total_sectors){ fclose(jf); return -1; }
+        next_seq=get_u64(hd+20);
+        gfc_fseek(jf,0,SEEK_END);
+    } else {
+        char *jp2=jpath(imgpath); jf=fopen(jp2,"wb+"); free(jp2);
+        if (!jf) return -1;
+        uint8_t hd[32]; memset(hd,0,32);
+        put_u32(hd,JRNL_MAGIC); put_u16(hd+4,1);
+        put_u32(hd+8,g->sector_size); put_u64(hd+12,g->total_sectors); put_u64(hd+20,next_seq);
+        fwrite(hd,32,1,jf);
+    }
+    J.jf=jf; J.imgf=imgf; J.g=g; J.seq=next_seq; J.drive=0; J.active=0;
+    return 0;
+}
+static void jbegin(const char *tag){
+    J.txn=J.seq; jrec_common(JREC_BEGIN);
+    uint16_t n=(uint16_t)strlen(tag); uint8_t t[2]; put_u16(t,n);
+    fwrite(t,2,1,J.jf); fwrite(tag,n,1,J.jf);
+    J.active=1;
+}
+static void jcommit(void){ J.active=0; jrec_common(JREC_COMMIT); }
+static void jclose(void){
+    if (!J.jf) return;
+    uint8_t hd[32];
+    gfc_fseek(J.jf,0,SEEK_SET); if(fread(hd,1,32,J.jf)!=32){}
+    put_u64(hd+20,J.seq);
+    gfc_fseek(J.jf,0,SEEK_SET); fwrite(hd,32,1,J.jf);
+    fclose(J.jf); memset(&J,0,sizeof J);
+}
+
+static int cmd_journal(int argc, char **argv)
+{
+    if (argc<1){ fprintf(stderr,"usage: gfctool journal <image>\n"); return 2; }
+    char *jp=jpath(argv[0]); FILE *jf=fopen(jp,"rb"); free(jp);
+    if (!jf){ printf("no journal for %s\n",argv[0]); return 0; }
+    uint8_t hd[32];
+    if (fread(hd,1,32,jf)!=32 || get_u32(hd)!=JRNL_MAGIC){ fprintf(stderr,"bad journal header\n"); fclose(jf); return 1; }
+    uint32_t ss=get_u32(hd+8);
+    printf("journal for %s: sector %u, next_seq %llu\n",argv[0],ss,(unsigned long long)get_u64(hd+20));
+    for(;;){
+        uint8_t rh[JREC_HDR_BYTES];
+        if (fread(rh,1,JREC_HDR_BYTES,jf)!=JREC_HDR_BYTES) break;
+        if (get_u32(rh)!=JREC_MAGIC){ fprintf(stderr,"corrupt record\n"); break; }
+        uint64_t seq=get_u64(rh+4), txn=get_u64(rh+12); uint8_t type=rh[20];
+        if (type==JREC_BEGIN){
+            uint8_t t[2]; if(fread(t,1,2,jf)!=2)break; uint16_t n=get_u16(t);
+            char *tag=malloc((size_t)n+1); if(fread(tag,1,n,jf)!=n){free(tag);break;} tag[n]=0;
+            printf("  txn %llu  BEGIN  \"%s\"\n",(unsigned long long)txn,tag); free(tag);
+        } else if (type==JREC_COMMIT){
+            printf("  txn %llu  COMMIT (seq %llu)\n",(unsigned long long)txn,(unsigned long long)seq);
+        } else if (type==JREC_WRITE){
+            uint8_t t[12]; if(fread(t,1,12,jf)!=12)break;
+            uint64_t sec=get_u64(t); uint32_t ns=get_u32(t+8);
+            gfc_fseek(jf,(uint64_t)ns*ss,SEEK_CUR);
+            printf("    seq %llu  WRITE %u sector(s) @ %llu (before-image saved)\n",
+                   (unsigned long long)seq,ns,(unsigned long long)sec);
+        } else break;
+    }
+    fclose(jf); return 0;
+}
+
+static int cmd_rewind(int argc, char **argv)
+{
+    const char *imgp=NULL; int have_to=0; uint64_t to_txn=0;
+    for (int i=0;i<argc;i++){
+        if (!strcmp(argv[i],"--to") && i+1<argc){ have_to=1; to_txn=strtoull(argv[++i],NULL,10); }
+        else if (argv[i][0]!='-' && !imgp) imgp=argv[i];
+        else { fprintf(stderr,"bad arg: %s\n",argv[i]); return 2; }
+    }
+    if (!imgp){ fprintf(stderr,"usage: gfctool rewind <image> [--to TXN]\n"); return 2; }
+
+    FILE *f=fopen(imgp,"rb+"); if(!f){ perror("fopen image"); return 1; }
+    gfc_geom g; char err[128]; uint8_t sb[4096];
+    if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
+    uint32_t ss=g.sector_size;
+
+    char *jp=jpath(imgp); FILE *jf=fopen(jp,"rb"); free(jp);
+    if (!jf){ fprintf(stderr,"no journal to rewind\n"); fclose(f); return 1; }
+    uint8_t hd[32];
+    if (fread(hd,1,32,jf)!=32 || get_u32(hd)!=JRNL_MAGIC){ fprintf(stderr,"bad journal\n"); fclose(jf); fclose(f); return 1; }
+
+    /* parse forward: collect begins and write records (with before-image offsets) */
+    struct { uint64_t txn, off; } *txns=NULL; int ntxn=0, captxn=0;
+    struct { uint64_t txn, sec, bioff; uint32_t ns; } *wr=NULL; int nwr=0, capwr=0;
+    uint64_t maxtxn=0;
+    for(;;){
+        uint64_t roff=(uint64_t)gfc_ftell(jf);
+        uint8_t rh[JREC_HDR_BYTES];
+        if (fread(rh,1,JREC_HDR_BYTES,jf)!=JREC_HDR_BYTES) break;
+        if (get_u32(rh)!=JREC_MAGIC) break;
+        uint64_t txn=get_u64(rh+12); uint8_t type=rh[20];
+        if (type==JREC_BEGIN){
+            uint8_t t[2]; if(fread(t,1,2,jf)!=2)break; uint16_t n=get_u16(t); gfc_fseek(jf,n,SEEK_CUR);
+            if(ntxn==captxn){ captxn=captxn?captxn*2:16; txns=realloc(txns,captxn*sizeof *txns); }
+            txns[ntxn].txn=txn; txns[ntxn].off=roff; ntxn++;
+            if (txn>maxtxn) maxtxn=txn;
+        } else if (type==JREC_COMMIT){
+            /* nothing */
+        } else if (type==JREC_WRITE){
+            uint8_t t[12]; if(fread(t,1,12,jf)!=12)break;
+            uint64_t sec=get_u64(t); uint32_t ns=get_u32(t+8);
+            uint64_t bioff=(uint64_t)gfc_ftell(jf);
+            gfc_fseek(jf,(uint64_t)ns*ss,SEEK_CUR);
+            if(nwr==capwr){ capwr=capwr?capwr*2:64; wr=realloc(wr,capwr*sizeof *wr); }
+            wr[nwr].txn=txn; wr[nwr].sec=sec; wr[nwr].ns=ns; wr[nwr].bioff=bioff; nwr++;
+        } else break;
+    }
+    if (ntxn==0){ fprintf(stderr,"journal empty, nothing to rewind\n"); fclose(jf); fclose(f); free(txns); free(wr); return 1; }
+
+    /* which txns are undone? */
+    #define UNDONE(T) (have_to ? (T)>to_txn : (T)==maxtxn)
+    uint64_t earliest=0, trunc_off=0; int any=0;
+    for (int i=0;i<ntxn;i++) if (UNDONE(txns[i].txn)){
+        if (!any || txns[i].txn<earliest){ earliest=txns[i].txn; trunc_off=txns[i].off; }
+        any=1;
+    }
+    if (!any){ printf("nothing to rewind (target txn %llu)\n",(unsigned long long)to_txn); fclose(jf); fclose(f); free(txns); free(wr); return 0; }
+
+    /* apply before-images in reverse sequence order for undone txns */
+    int undone_w=0, undone_t=0;
+    uint8_t *bi=malloc(ss);
+    for (int i=nwr-1;i>=0;i--) if (UNDONE(wr[i].txn)){
+        for (uint32_t k=0;k<wr[i].ns;k++){
+            gfc_fseek(jf, wr[i].bioff + (uint64_t)k*ss, SEEK_SET);
+            if (fread(bi,1,ss,jf)!=ss){ fprintf(stderr,"short before-image read\n"); break; }
+            write_sector(f,&g,wr[i].sec+k,bi);     /* J inactive: not re-journalled */
+        }
+        undone_w++;
+    }
+    for (int i=0;i<ntxn;i++) if (UNDONE(txns[i].txn)) undone_t++;
+    free(bi);
+
+    /* truncate journal: keep prefix [0,trunc_off), reset next_seq to earliest */
+    uint8_t *prefix=malloc(trunc_off);
+    gfc_fseek(jf,0,SEEK_SET); if(fread(prefix,1,trunc_off,jf)!=trunc_off){}
+    put_u64(prefix+20,earliest);
+    fclose(jf);
+    { char *jp2=jpath(imgp); FILE *jw=fopen(jp2,"wb"); free(jp2);
+      if (jw){ fwrite(prefix,1,trunc_off,jw); fclose(jw); } }
+    free(prefix); free(txns); free(wr); fclose(f);
+
+    printf("rewound %d transaction(s), restored %d write record(s); journal now ends before txn %llu\n",
+           undone_t, undone_w, (unsigned long long)earliest);
+    return 0;
+}
+
 static int cmd_ls(int argc, char **argv)
 {
     if (argc<1){ fprintf(stderr,"usage: gfctool ls <image>\n"); return 2; }
@@ -532,6 +726,12 @@ static int cmd_mkfile(int argc, char **argv)
     int64_t run=map_find_run(map,&g,first,real0,need);
     if (run<0){ fprintf(stderr,"no contiguous space for %llu cluster(s) in AG0\n",(unsigned long long)need); free(map); fclose(s); fclose(f); return 1; }
 
+    /* begin a journalled transaction around the mutation */
+    char tag[80]; snprintf(tag,sizeof tag,"mkfile %s",name);
+    int jrn = (jopen(imgp,f,&g)==0);
+    if (jrn) jbegin(tag);
+    else fprintf(stderr,"warning: journaling disabled (cannot open journal)\n");
+
     /* mark allocated, refresh checks + AG0 header */
     for (uint64_t k=0;k<need;k++) map_set(map,&g,(uint32_t)(run+k));
     map_finalise_checks(map,&g);
@@ -569,7 +769,9 @@ static int cmd_mkfile(int argc, char **argv)
     put_u64(root+OBJ_Length,4+(uint64_t)(nent+1)*DIRENT_BYTES);
     put_u32(root+OBJ_HdrCheck,sum_words(root,OBJ_HdrCheck));
     write_run(f,&g,ag_data_start(&g,0),1,root);
-    free(root); free(map); fclose(f);
+    free(root); free(map);
+    if (jrn){ jcommit(); jclose(); }
+    fclose(f);
 
     printf("added '%s' (%llu bytes, %llu cluster%s) at sector %llu\n",
            name,(unsigned long long)fsize,(unsigned long long)need,need==1?"":"s",(unsigned long long)start_sec);
@@ -583,18 +785,22 @@ int main(int argc, char **argv)
           "gfctool - FileCore G-format reference (bounty #40)\n"
           "usage:\n"
           "  gfctool format <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]\n"
-          "  gfctool mkfile <image> <name> <srcfile>\n"
-          "  gfctool ls     <image>\n"
-          "  gfctool check  <image>\n"
-          "  gfctool info   <image>\n"
+          "  gfctool mkfile  <image> <name> <srcfile>\n"
+          "  gfctool ls      <image>\n"
+          "  gfctool journal <image>\n"
+          "  gfctool rewind  <image> [--to TXN]\n"
+          "  gfctool check   <image>\n"
+          "  gfctool info    <image>\n"
           "sizes accept K/M/G/T/E suffixes.\n");
         return 2;
     }
-    if (!strcmp(argv[1],"format")) return cmd_format(argc-2,argv+2);
-    if (!strcmp(argv[1],"mkfile")) return cmd_mkfile(argc-2,argv+2);
-    if (!strcmp(argv[1],"ls"))     return cmd_ls    (argc-2,argv+2);
-    if (!strcmp(argv[1],"check"))  return cmd_check (argc-2,argv+2);
-    if (!strcmp(argv[1],"info"))   return cmd_info  (argc-2,argv+2);
+    if (!strcmp(argv[1],"format"))  return cmd_format (argc-2,argv+2);
+    if (!strcmp(argv[1],"mkfile"))  return cmd_mkfile (argc-2,argv+2);
+    if (!strcmp(argv[1],"ls"))      return cmd_ls     (argc-2,argv+2);
+    if (!strcmp(argv[1],"journal")) return cmd_journal(argc-2,argv+2);
+    if (!strcmp(argv[1],"rewind"))  return cmd_rewind (argc-2,argv+2);
+    if (!strcmp(argv[1],"check"))   return cmd_check  (argc-2,argv+2);
+    if (!strcmp(argv[1],"info"))    return cmd_info   (argc-2,argv+2);
     fprintf(stderr,"unknown command: %s\n",argv[1]);
     return 2;
 }

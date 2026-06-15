@@ -19,3 +19,4 @@ desktop.ini
 # scratch test fixtures
 tools/gfcref/*.txt
 tools/gfcref/*.bin
+*.gfcjrnl

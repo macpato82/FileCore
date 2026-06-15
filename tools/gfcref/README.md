@@ -21,11 +21,13 @@ Or directly: `gcc -std=c99 -O2 -Wall -o gfctool gfctool.c gfc_check.c`
 ## Usage
 
 ```
-gfctool format <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
-gfctool mkfile <image> <name> <srcfile>
-gfctool ls     <image>
-gfctool check  <image>
-gfctool info   <image>
+gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
+gfctool mkfile  <image> <name> <srcfile>   # journalled mutation
+gfctool ls      <image>
+gfctool journal <image>                     # list journal transactions
+gfctool rewind  <image> [--to TXN]          # undo last txn (or back to TXN)
+gfctool check   <image>
+gfctool info    <image>
 ```
 Sizes accept `K/M/G/T/E` suffixes (powers of 1024). Defaults: 256 MiB image, 4096-byte
 sectors, 64 MiB allocation groups, cluster = sector size.
@@ -58,10 +60,25 @@ CHECK OK: 1 AGs, 16384 sectors, all structures consistent
 `check` reports the first errors with AG/zone/cluster/object locations and exits non-zero
 on failure (verified against deliberate corruption of map bits and object headers).
 
+## Journaling & rewind (M2)
+
+`mkfile` runs inside a **transaction** and captures a before-image of every sector it
+overwrites into a sidecar journal `‹image›.gfcjrnl` — the host-side mirror of the FileCore
+journaling hooks specified in [design/04](../../design/04-Journaling-v1.md). `journal` lists
+the transactions; `rewind` replays before-images in reverse to undo whole transactions.
+
+```
+$ gfctool mkfile disc.img b.dat b.dat
+$ gfctool rewind disc.img
+rewound 1 transaction(s), restored 4 write record(s); journal now ends before txn 7
+```
+Verified: after `rewind` the image is **byte-identical** (SHA-256) to its pre-transaction
+state and `check` still passes; repeated `rewind` fully unwinds to the formatted disc.
+
 ## Files
 - `gfc.h` — on-disc offsets, magics, geometry struct, little-endian accessors.
 - `gfc_check.c` — check-byte algorithms ported from the FileCore sources.
-- `gfctool.c` — geometry, `format`, `mkfile`, `ls`, `check`, `info`.
+- `gfctool.c` — geometry, `format`, `mkfile`, `ls`, `journal`, `rewind`, `check`, `info`.
 
 ## Scope / v1 limitations
 - Objects are **single contiguous cluster runs** (one extent); fragmented / multi-extent
