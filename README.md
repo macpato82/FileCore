@@ -1,6 +1,6 @@
 # FileCore Large-Disc Format
 
-Design and reference work for **RISC OS Open [Bounty #40](https://www.riscosopen.org/bounty/polls/40)** —
+Design and reference work for FileCore
 adding a new native disc format to RISC OS's filing systems for large discs.
 
 ## Goal
