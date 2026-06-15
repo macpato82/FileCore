@@ -109,6 +109,20 @@ Ok ($bad -eq 0) "60 random ops, check passed every step"
 $mismatch=0; foreach($k in $live.Keys){ G read $img3 $k "$wd\v.out" | Out-Null; if((Hash "$wd\v.out") -ne $live[$k]){ $mismatch++ } }
 Ok ($mismatch -eq 0) "all $($live.Count) surviving files read back identical"
 
+Write-Host "`n[10] rename / move"
+$img4 = Join-Path $wd "r.img"
+G format $img4 --size 512K --sector 512 --ag-size 64K | Out-Null
+G mkdir $img4 a | Out-Null; G mkdir $img4 b | Out-Null
+MakeFile "$wd\r.bin" 40000
+G mkfile $img4 a/r.bin "$wd\r.bin" | Out-Null
+Ok ((G rename $img4 a/r.bin a/r2.bin) -eq 0) "rename in place"
+Ok ((G rename $img4 a/r2.bin b/r3.bin) -eq 0) "move across dirs"
+G read $img4 b/r3.bin "$wd\r.out" | Out-Null
+Ok ((Hash "$wd\r.bin") -eq (Hash "$wd\r.out")) "moved content identical"
+G mkfile $img4 b/exist.bin "$wd\r.bin" | Out-Null
+Ok ((G rename $img4 b/r3.bin b/exist.bin) -ne 0) "rename onto existing refused"
+Ok ((G check $img4) -eq 0) "check after renames"
+
 Write-Host "`n================  $pass passed, $fail failed  ================"
 Remove-Item -Recurse -Force $wd
 if ($fail -gt 0) { exit 1 } else { exit 0 }

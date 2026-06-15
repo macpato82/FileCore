@@ -26,6 +26,7 @@ gfctool mkfile  <image> <path> <srcfile>   # journalled; multi-extent, cross-AG
 gfctool read    <image> <path> <outfile>   # extract a file's contents
 gfctool delete  <image> <path>              # journalled; frees clusters; rmdir if empty
 gfctool mkdir   <image> <path>              # create a subdirectory (journalled)
+gfctool rename  <image> <oldpath> <newpath> # rename / move (journalled)
 gfctool ls      <image> [path]              # paths use '/' (-> RISC OS '.')
 gfctool journal <image>                     # list journal transactions
 gfctool rewind  <image> [--to TXN]          # undo last txn (or back to TXN)

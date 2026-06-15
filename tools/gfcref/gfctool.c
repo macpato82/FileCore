@@ -1073,6 +1073,78 @@ static int cmd_mkdir(int argc, char **argv)
     return 0;
 }
 
+/* remove entry `idx` from a dir cluster buffer (caller writes it back) */
+static void dir_remove_idx(uint8_t *d, uint32_t idx){
+    uint32_t n=get_u32(d+OBJ_HDR_BYTES);
+    uint8_t *base=d+OBJ_HDR_BYTES+4;
+    memmove(base+(size_t)idx*DIRENT_BYTES, base+(size_t)(idx+1)*DIRENT_BYTES,
+            (size_t)(n-idx-1)*DIRENT_BYTES);
+    put_u32(d+OBJ_HDR_BYTES,n-1);
+    put_u64(d+OBJ_Length,4+(uint64_t)(n-1)*DIRENT_BYTES);
+    put_u32(d+OBJ_HdrCheck,sum_words(d,OBJ_HdrCheck));
+}
+
+static int cmd_rename(int argc, char **argv)
+{
+    if (argc<3){ fprintf(stderr,"usage: gfctool rename <image> <oldpath> <newpath>\n"); return 2; }
+    const char *imgp=argv[0], *oldp=argv[1], *newp=argv[2];
+    FILE *f=fopen(imgp,"rb+"); if(!f){ perror("fopen image"); return 1; }
+    gfc_geom g; char err[128]; uint8_t sb[4096];
+    if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
+    uint32_t clu_bytes=1u<<g.log2_bpmb;
+
+    /* locate source entry in its parent */
+    char oleaf[64]; uint64_t op=resolve_parent(f,&g,oldp,oleaf,sizeof oleaf);
+    if (!op){ fprintf(stderr,"'%s' not found\n",oldp); fclose(f); return 1; }
+    uint8_t *od=calloc(1,clu_bytes); read_run(f,&g,op,1,od);
+    uint32_t on=get_u32(od+OBJ_HDR_BYTES), oidx=on;
+    uint64_t hdr_sec=0,len=0; uint32_t load=0,exec=0; uint8_t ty=0;
+    for (uint32_t e=0;e<on;e++){
+        const uint8_t *de=od+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
+        for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
+        if(!strcmp(nm,oleaf)){ oidx=e; hdr_sec=get_u64(de+DE_StartSector); len=get_u64(de+DE_Length);
+            load=get_u32(de+DE_Load); exec=get_u32(de+DE_Exec); ty=de[DE_Type]; break; }
+    }
+    if (oidx==on){ fprintf(stderr,"'%s' not found\n",oldp); free(od); fclose(f); return 1; }
+
+    /* resolve destination parent + leaf */
+    char nleaf[64]; uint64_t np=resolve_parent(f,&g,newp,nleaf,sizeof nleaf);
+    if (!np){ fprintf(stderr,"destination path not found: %s\n",newp); free(od); fclose(f); return 1; }
+    if (dir_find(f,&g,np,nleaf,NULL,NULL)){ fprintf(stderr,"'%s' already exists\n",newp); free(od); fclose(f); return 1; }
+    { uint8_t *pd=calloc(1,clu_bytes); read_run(f,&g,np,1,pd);
+      uint32_t pn=get_u32(pd+OBJ_HDR_BYTES); uint64_t cap=get_u64(pd+OBJ_ClusterCount)*clu_bytes; free(pd);
+      if (np!=op && OBJ_HDR_BYTES+4+(uint64_t)(pn+1)*DIRENT_BYTES>cap){ fprintf(stderr,"destination directory full\n"); free(od); fclose(f); return 1; } }
+
+    char tag[96]; snprintf(tag,sizeof tag,"rename %s -> %s",oldp,newp);
+    int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
+
+    /* update the object's own name */
+    uint8_t *oc=calloc(1,clu_bytes); read_run(f,&g,hdr_sec,1,oc);
+    memset(oc+OBJ_Name,' ',OBJ_NameLen);
+    { size_t l=strlen(nleaf); if(l>OBJ_NameLen)l=OBJ_NameLen; memcpy(oc+OBJ_Name,nleaf,l); }
+    put_u32(oc+OBJ_HdrCheck,sum_words(oc,OBJ_HdrCheck));
+    write_run(f,&g,hdr_sec,1,oc); free(oc);
+
+    if (np==op){
+        /* same directory: rename the entry in place */
+        uint8_t *de=od+OBJ_HDR_BYTES+4+(size_t)oidx*DIRENT_BYTES;
+        memset(de+DE_Name,' ',DE_NameLen);
+        { size_t l=strlen(nleaf); if(l>DE_NameLen)l=DE_NameLen; memcpy(de+DE_Name,nleaf,l); }
+        put_u32(od+OBJ_HdrCheck,sum_words(od,OBJ_HdrCheck));
+        write_run(f,&g,op,1,od);
+    } else {
+        /* move: remove from old parent, add to new parent */
+        dir_remove_idx(od,oidx);
+        write_run(f,&g,op,1,od);
+        dir_add_entry(f,&g,np,nleaf,ty,load,exec,len,hdr_sec);
+    }
+    if (jrn){ jcommit(); jclose(); }
+    free(od); fclose(f);
+    printf("renamed '%s' -> '%s'\n",oldp,newp);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc<2){
@@ -1084,6 +1156,7 @@ int main(int argc, char **argv)
           "  gfctool read    <image> <path> <outfile>\n"
           "  gfctool delete  <image> <path>\n"
           "  gfctool mkdir   <image> <path>\n"
+          "  gfctool rename  <image> <oldpath> <newpath>\n"
           "  gfctool ls      <image> [path]\n"
           "  gfctool journal <image>\n"
           "  gfctool rewind  <image> [--to TXN]\n"
@@ -1097,6 +1170,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[1],"read"))    return cmd_read   (argc-2,argv+2);
     if (!strcmp(argv[1],"delete"))  return cmd_delete (argc-2,argv+2);
     if (!strcmp(argv[1],"mkdir"))   return cmd_mkdir  (argc-2,argv+2);
+    if (!strcmp(argv[1],"rename"))  return cmd_rename (argc-2,argv+2);
     if (!strcmp(argv[1],"ls"))      return cmd_ls     (argc-2,argv+2);
     if (!strcmp(argv[1],"journal")) return cmd_journal(argc-2,argv+2);
     if (!strcmp(argv[1],"rewind"))  return cmd_rewind (argc-2,argv+2);
