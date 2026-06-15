@@ -22,6 +22,8 @@ Or directly: `gcc -std=c99 -O2 -Wall -o gfctool gfctool.c gfc_check.c`
 
 ```
 gfctool format <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
+gfctool mkfile <image> <name> <srcfile>
+gfctool ls     <image>
 gfctool check  <image>
 gfctool info   <image>
 ```
@@ -30,32 +32,43 @@ sectors, 64 MiB allocation groups, cluster = sector size.
 
 ### Example
 ```
-$ gfctool format disc.img --size 256M --name MyDisc
-Formatted disc.img: 256.00 MiB, 4 AGs, sector 4096, cluster 4096, 1 map-zone(s)/AG
+$ gfctool format disc.img --size 64M --name Demo
+Formatted disc.img: 64.00 MiB, 1 AGs, sector 4096, cluster 4096, 1 map-zone(s)/AG
+$ gfctool mkfile disc.img hello.txt hello.txt
+added 'hello.txt' (47 bytes, 1 cluster) at sector 5
+$ gfctool ls disc.img
+$ (1 object)
+  hello.txt     file          47 bytes  load=fffffd00 exec=00000000
 $ gfctool check disc.img
-CHECK OK: 4 AGs, 65536 sectors, all structures consistent
+CHECK OK: 1 AGs, 16384 sectors, all structures consistent
 ```
 
 ## What `check` verifies
 
 1. Superblock checksum; primary == secondary copy; GFC magic + version.
 2. Geometry self-consistency; image length == `TotalSectors × sector_size`; `AGCount`.
-3. Every AG header: magic, AG number, base/offsets, checksum.
-4. Every AG map: each zone's `ZoneCheck`; `CrossCheck` EOR == `0xFF`; allocation bits
-   match the expected reserved set; `ClustersFree`/`ClustersTotal` fields.
-5. Root directory check byte.
+3. Root + every object record: `OBJ_MAGIC`, header checksum, `ObjId`, `StartSector`,
+   cluster run within range.
+4. Every AG header (magic/number/offsets/checksum) and map (each zone's `ZoneCheck`;
+   `CrossCheck` EOR == `0xFF`).
+5. **Map ↔ extents consistency:** AG 0's allocated bits == structural-reserved ∪ root ∪
+   every object run (no leaked, overlapping or doubly-allocated clusters);
+   `ClustersFree`/`ClustersTotal`.
 
-`check` reports the first errors with AG/zone/cluster locations and exits non-zero on
-failure (verified against deliberate byte corruption).
+`check` reports the first errors with AG/zone/cluster/object locations and exits non-zero
+on failure (verified against deliberate corruption of map bits and object headers).
 
 ## Files
 - `gfc.h` — on-disc offsets, magics, geometry struct, little-endian accessors.
 - `gfc_check.c` — check-byte algorithms ported from the FileCore sources.
-- `gfctool.c` — geometry, `format`, `check`, `info`.
+- `gfctool.c` — geometry, `format`, `mkfile`, `ls`, `check`, `info`.
 
 ## Scope / v1 limitations
-- Root directory is a minimal contiguous placeholder (full BigDir population is M1b).
-- Per-AG allocation uses a **cluster bitmap + extents** model (see design/02 §3 rationale),
-  not the E+ fragment/free-chain encoding; the production FileCore port may adopt either.
-- `check` iterates every AG, so checking a genuinely huge image is O(AGCount); `info`
-  is O(1) and validates the geometry math for any size up to 16 EB.
+- Objects are **single contiguous cluster runs** (one extent); fragmented / multi-extent
+  objects and sub-directory creation (`mkdir`) are a later milestone.
+- All user objects are allocated in **AG 0**; cross-AG allocation is later.
+- Root directory is a single cluster (~100 entries at 4 KB); overflow reports "root full".
+- Per-AG allocation uses a **cluster bitmap + extents** model (see design/02 §3 and
+  design/03), not the E+ fragment/free-chain; the production port may adopt either.
+- `check`/`mkfile` iterate AG 0 (and `check` every AG), so they are O(AG); `info` is O(1)
+  and validates the geometry math for any size up to 16 EB.

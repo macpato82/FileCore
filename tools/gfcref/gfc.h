@@ -66,6 +66,35 @@
 #define AGH_ClustersFree    64
 #define AGH_LargestFreeRun  72
 
+/* ---- object record (start of an object's first cluster) ---- */
+#define GFC_OBJ_MAGIC       0x424F4647u   /* "GFOB" LE */
+#define OBJ_HDR_BYTES       64
+#define OBJ_TYPE_FILE       1
+#define OBJ_TYPE_DIR        2
+#define OBJ_Magic           0
+#define OBJ_ObjId           4
+#define OBJ_Type            12
+#define OBJ_Attrs           13
+#define OBJ_Load            16
+#define OBJ_Exec            20
+#define OBJ_Length          24
+#define OBJ_StartSector     32
+#define OBJ_ClusterCount    40
+#define OBJ_Name            48
+#define OBJ_NameLen         10
+#define OBJ_HdrCheck        60
+
+/* ---- directory contents (follow the object record in a dir object) ---- */
+#define DIRENT_BYTES        40
+#define DE_Name             0
+#define DE_NameLen          12
+#define DE_Type             12
+#define DE_Attrs            13
+#define DE_Load             16
+#define DE_Exec             20
+#define DE_Length           24
+#define DE_StartSector      32
+
 /* ---- map zone header ---- */
 #define ZONE_HDR_BYTES      4   /* ZoneCheck, CrossCheck, reserved[2] */
 
