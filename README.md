@@ -69,6 +69,7 @@ object extent (no leaks/overlaps) — and `rewind` restores a byte-identical ear
 ```
 design/         Design documents and format specifications
 tools/gfcref/   Host-side reference formatter / checker / journaller
+tools/armcheck/ Host-side verifier for the ARM patch address arithmetic
 ```
 
 - [`design/01-NewDiscFormat-Spec.md`](design/01-NewDiscFormat-Spec.md) — design spec & decision.

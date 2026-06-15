@@ -5,9 +5,11 @@ linked/
 *.o
 *.obj
 
-# gfcref reference tool artefacts
+# reference tool artefacts
 tools/gfcref/gfctool
 tools/gfcref/gfctool.exe
+tools/armcheck/macrocheck
+tools/armcheck/macrocheck.exe
 *.img
 
 # Editor / OS cruft

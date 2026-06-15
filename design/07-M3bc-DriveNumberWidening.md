@@ -118,6 +118,10 @@ The drive is squeezed into bits 29-31 of the 32-bit `R2` handed to `DoDiscOp` �
    low-level FS takes the unchanged 3-bit path — zero behavioural change there.
 
 ## 5. Verification (build loop)
+
+> The `DrvRecPtr` Sz=40 arithmetic (§2.2) is **machine-verified** by
+> [`tools/armcheck/macrocheck`](../tools/armcheck/README.md) alongside the M3a branches.
+
 - objasm builds for the default and legacy flag sets; `SzDrvRec=40` asserts hold; `<&1000` still OK.
 - RPCEmu: mount/read/write/dismount on ≤ 8 drives (legacy path) unchanged.
 - With a DiscOp64-capable low-level FS and `MaxDrives>8`: exercise a drive index ≥ 8 end-to-end.

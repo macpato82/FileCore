@@ -127,6 +127,11 @@ first (or rely on the existing per-field init, which already writes every field)
 
 ## 6. Verification checklist (needs the RISC OS toolchain)
 
+> The macro address arithmetic (§3) is **machine-verified** host-side by
+> [`tools/armcheck/macrocheck`](../tools/armcheck/README.md) — all branches compute
+> `base + index*SzRec` for indices 0..255. The items below still need an objasm/RPCEmu build.
+
+
 1. `objasm` builds clean for the default flag set (BigDisc+BigDir+BigShare+DynamicMaps ⇒ SzDiscRec=56,
    SzDrvRec=36) and for a legacy flag set.
 2. `ASSERT :INDEX:{VAR}<&1000` still holds (now with headroom).
