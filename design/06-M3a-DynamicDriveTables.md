@@ -131,11 +131,17 @@ first (or rely on the existing per-field init, which already writes every field)
 > [`tools/armcheck/macrocheck`](../tools/armcheck/README.md) — all branches compute
 > `base + index*SzRec` for indices 0..255.
 >
-> **Phase 1 build-verified (2026): the pointerised macros assemble and link cleanly** with
-> objasm 4.13 in RPCEmu (RISC OS 5 / IOMD, APCS-32) — unmodified→patched FileCore both produce
-> `rm.IOMD.FileCore` with 0 errors. The verified diff is [`patches/m3a-phase1.diff`](../patches/m3a-phase1.diff).
-> Phase 1 keeps the static tables and only routes access through `DrvRecsPtr`/`DiscRecsPtr`
-> (behaviour-identical). Phase 2 (below) swaps the tables for a dynamically-claimed block.
+> **M3a is build-verified** with objasm 4.13 in RPCEmu (RISC OS 5 / IOMD, APCS-32) — FileCore
+> assembles and links to `rm.IOMD.FileCore` with **0 errors**, both phases:
+> - **Phase 1** — route record access through `DrvRecsPtr`/`DiscRecsPtr` (static tables kept;
+>   behaviour-identical). Verifies the macro rewrite.
+> - **Phase 2** — drive+disc record tables become a single **RMA-claimed block** (`OS_Module`
+>   claim at init, freed on Die), out of the `<&1000` static workspace; the two direct
+>   `sbaddr DiscRecs` scans (`Commands`, `FileCore40`) load `DiscRecsPtr`.
+>
+> The complete verified diff is [`patches/m3a.diff`](../patches/m3a.diff) (Defns, FileCore00,
+> MyMacros, InitDieSvc, Commands, FileCore40). Runtime testing (boot + mount) and raising
+> `MaxDrives` past 8 follow with M3b/M3c.
 
 
 1. `objasm` builds clean for the default flag set (BigDisc+BigDir+BigShare+DynamicMaps ⇒ SzDiscRec=56,
