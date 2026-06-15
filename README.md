@@ -44,7 +44,8 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build- **and runtime**-verified on RPCEmu |
-| **M3b/c** | Drive-number widening (record index + address routing) | ✅ drafted (build pending) |
+| **M3b** | Drive-number widening (DrvsDisc index) | 🔨 phase b.0 (record→40, ×40 macro) build+runtime-verified; b.1 (migrate number + rework `<8` disambiguation) pending |
+| **M3c** | DiscOp64 drive routing in GenIndDiscOp | ✅ drafted (design/07) |
 | M4 | G-format read support in FileCore (ARM) | planned |
 | M5 | G-format write / allocation (ARM) | planned |
 | M6 | Format/layout SWIs + ADFS/SCSIFS integration | planned |
@@ -60,9 +61,13 @@ softloadable `rm.IOMD.FileCoreSA`. **M3a** (dynamic drive/disc record tables: po
 then an `OS_Module`-claimed RMA block freed on Die — [`patches/m3a.diff`](patches/m3a.diff))
 assembles + links with 0 errors **and runs**: softloaded over the ROM FileCore in a live RISC OS,
 ADFS re-creates its instance and `FileCore_Create` runs the new record-table claim/init cleanly
-with the desktop still up. Next: M3b/M3c drive-number widening (the `DrvsDisc` byte is overloaded —
-record-number XOR flag-state disambiguated by `< 8` — so widening past 8 is a behaviour-changing
-rewrite, now backed by this runtime-test loop).
+with the desktop still up. **M3b** is underway: phase b.0 (Drive Record grown to 40 bytes for a future full-width
+disc-record index, `DrvRecPtr` ×40) is build+runtime-verified; phase b.1 (migrate the index out
+of the overloaded `DrvsDisc` byte — record-number XOR flag-state disambiguated by `< 8` — and
+rework that disambiguation) is paused at a checkpoint. b.1's "has-record" path wants a *mounted*
+FileCore disc to fully runtime-test, which is awkward in this RO5/RPCEmu setup (`.adf` floppy
+mounting is broken under RO5, the IDE image is empty, RAMFS needs a reset). WIP diff:
+[`patches/m3b-progress.diff`](patches/m3b-progress.diff).
 
 ## Reference tool
 

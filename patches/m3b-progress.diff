@@ -1,0 +1,225 @@
+# M3 ARM work-in-progress (build + RUNTIME verified on RPCEmu/RO5 via softload).
+# = M3a (dynamic record tables, complete) + M3b.0 (Drive Record grown to 40 for the
+#   future full-width disc-record index byte; DrvRecPtr macro x40). M3b.1 (migrate the
+#   number into DrvsDiscNum + rework the <8 disambiguation) is still pending.
+diff --git "a/Sources/FileSys/FileCore/s/Defns" "b/Sources/FileSys/FileCore/s/Defns"
+index 98df71c..7041081 100644
+--- "a/Sources/FileSys/FileCore/s/Defns"
++++ "b/Sources/FileSys/FileCore/s/Defns"
+@@ -194,6 +194,11 @@ NewHiFsBits     * BadFs :OR: EmptyFs
+  |
+ HiFsBits        * BadFs :OR: EmptyFs
+  ]
++; M3b: full-width disc-record index. Phase b.0 just reserves the field (unused,
++; SzDrvRec 36->40); phase b.1 migrates the number here from DrvsDisc bits 0-2 and
++; reworks the "< 8" disambiguation, so >8 disc records become addressable.
++DrvsDiscNum     # 1     ; disc record number (0..MaxDiscs-1), or NoDiscRec
++                # 3     ; pad: keep SzDrvRec macro-friendly (40 = *5 <<3)
+ SzDrvRec        # 0
+ 
+ 
+@@ -267,6 +272,10 @@ MaxFreeLinkBits * 15    ; Though 'BigMaps' extend this limit
+ MaxIdLenSmlMap  * 15
+ MaxIdLenBigMap  * 21
+ 
++; M3a: size of the drive/disc record tables (was a literal 8). Phase 2 makes
++; the tables dynamically-allocated so this can grow toward 256.
++MaxDrives       * 8
++
+ ZoneDiscRecSz   * 60    ;reserve additional bytes
+ Zone0Bits       * ZoneDiscRecSz*8
+                 ASSERT ZoneDiscRecSz >= SzDiscRec
+diff --git "a/Sources/FileSys/FileCore/s/FileCore00" "b/Sources/FileSys/FileCore/s/FileCore00"
+index b7fa9d3..eb9e845 100644
+--- "a/Sources/FileSys/FileCore/s/FileCore00"
++++ "b/Sources/FileSys/FileCore/s/FileCore00"
+@@ -270,9 +270,11 @@ CounterReadCall # 4
+ DoCompZoneBase  # 4           ; Workspace for DoCompMoves
+               ]
+ 
+-                ; Records
+-DrvRecs         # SzDrvRec * 8
+-DiscRecs        # SzDiscRec * 8
++                ; Records (M3a phase 2): the drive + disc record tables are now a
++                ; single RMA-claimed block (claimed at init, freed at Die), addressed
++                ; via these pointers - no longer in the <&1000 static workspace.
++DrvRecsPtr      # 4           ; -> drive record table (MaxDrives entries)
++DiscRecsPtr     # 4           ; -> disc record table (follows the drive table)
+ 
+                 ; Data move scatter list
+ ScatterMax      * 8           ; max # (address,length) pairs in buffer
+@@ -299,8 +301,8 @@ DirCache        # 0           ; MUST BE LAST
+               [ Dev
+                 ! 0, "BufChainsRoot = " :CC: :STR: :INDEX: BufChainsRoot
+                 ! 0, "DirCache = " :CC: :STR: :INDEX: DirCache
+-                ! 0, "DrvRecs = " :CC: :STR: :INDEX: DrvRecs
+-                ! 0, "DiscRecs = " :CC: :STR: :INDEX: DiscRecs
++                ! 0, "DrvRecsPtr = " :CC: :STR: :INDEX: DrvRecsPtr
++                ! 0, "DiscRecsPtr = " :CC: :STR: :INDEX: DiscRecsPtr
+               ]
+ 
+         ALIGN
+diff --git "a/Sources/FileSys/FileCore/s/MyMacros" "b/Sources/FileSys/FileCore/s/MyMacros"
+index 24e9964..eba8fad 100644
+--- "a/Sources/FileSys/FileCore/s/MyMacros"
++++ "b/Sources/FileSys/FileCore/s/MyMacros"
+@@ -135,36 +135,48 @@ $lab    DiscRecPtr $Rptr,$Rindex,$cond
+         RestPSR SB,,f
+         Pull    "SB,LR,R0"
+  ]
++; M3a: base of the disc-record table is held in DiscRecsPtr (workspace), loaded
++; into SB across a balanced Push/Pull; each branch keeps its existing multiply.
+   [ BigShare
+    [ BigDir
+       ASSERT    SzDiscRec=56
+       RSB$cond  $Rptr, $Rindex, $Rindex, ASL #3 ;*7
+-      ADD$cond  $Rptr, SB, $Rptr, ASL #3         ;7*8=56
++      Push      "SB"
++      LDR$cond  SB, DiscRecsPtr
++      ADD$cond  $Rptr, SB, $Rptr, ASL #3         ;dynbase + Rindex*56
++      Pull      "SB"
+    |
+         ASSERT  SzDiscRec=48
+         ADD$cond $Rptr, $Rindex, $Rindex, ASL #1 ;*3
+-        ADD$cond $Rptr,SB,$Rptr,ASL #4           ;SB+Rindex*SzDiscRec
++        Push     "SB"
++        LDR$cond SB, DiscRecsPtr
++        ADD$cond $Rptr,SB,$Rptr,ASL #4           ;dynbase + Rindex*48
++        Pull     "SB"
+    ]
+   |
+         ASSERT  SzDiscRec=44
+    [ $Rptr<>$Rindex
+         ADD$cond $Rptr, $Rindex, $Rindex, ASL #1 ;*3
+         ADD$cond $Rptr, $Rptr, $Rindex, ASL #3   ;+*8=*11
+-        ADD$cond $Rptr, SB, $Rptr, ASL #2        ;SB+Rindex*SzDiscRec
+    |
+         Push    "SB"
+         ADD$cond SB, $Rindex, $Rindex, ASL #1    ;*3
+         ADD$cond $Rptr, SB, $Rindex, ASL #3      ;+*8=*11
+         Pull    "SB"
+-        ADD$cond $Rptr, SB, $Rptr, ASL #2        ;SB+Rindex*SzDiscRec
+    ]
++        Push    "SB"
++        LDR$cond SB, DiscRecsPtr
++        ADD$cond $Rptr, SB, $Rptr, ASL #2        ;dynbase + Rindex*44
++        Pull    "SB"
+   ]
+  |
+         ASSERT  SzDiscRec=40
+         ADD$cond $Rptr,$Rindex,$Rindex,ASL #2   ;*5
+-        ADD$cond $Rptr,SB,$Rptr,ASL #3          ;SB+Rindex*SzDiscRec
++        Push    "SB"
++        LDR$cond SB, DiscRecsPtr
++        ADD$cond $Rptr,SB,$Rptr,ASL #3          ;dynbase + Rindex*40
++        Pull    "SB"
+  ]
+-        MinOps  ADD, ADD, $Rptr, $Rptr, (:INDEX:DiscRecs), $cond
+         MEND
+ 
+ 
+@@ -187,23 +199,32 @@ $lab    DrvRecPtr $Rptr,$Rindex,$cond
+         Pull    "SB,LR,R0"
+  ]
+ 
++; M3a: base of the drive-record table is held in DrvRecsPtr (workspace).
+  [ DynamicMaps
+-        ASSERT  SzDrvRec=36
+-        ADD$cond        $Rptr, $Rindex, $Rindex, LSL #3
+-        ADD$cond        $Rptr, SB, $Rptr, LSL #2
++        ASSERT  SzDrvRec=40
++        ADD$cond        $Rptr, $Rindex, $Rindex, LSL #2   ;*5
++        Push            "SB"
++        LDR$cond        SB, DrvRecsPtr
++        ADD$cond        $Rptr, SB, $Rptr, LSL #3          ;dynbase + Rindex*40
++        Pull            "SB"
+  |
+ 
+    [ BigDisc
+         ASSERT  SzDrvRec=24
+         ADD$cond $Rptr,$Rindex,$Rindex,LSL #1
+-        ADD$cond $Rptr,SB,$Rptr,LSL#3
++        Push     "SB"
++        LDR$cond SB, DrvRecsPtr
++        ADD$cond $Rptr,SB,$Rptr,LSL#3                     ;dynbase + Rindex*24
++        Pull     "SB"
+    |
+         ASSERT  SzDrvRec=20
+         ADD$cond $Rptr,$Rindex,$Rindex,LSL #2
+-        ADD$cond $Rptr,SB,$Rptr,LSL#2
++        Push     "SB"
++        LDR$cond SB, DrvRecsPtr
++        ADD$cond $Rptr,SB,$Rptr,LSL#2                     ;dynbase + Rindex*20
++        Pull     "SB"
+    ]
+  ]
+-        MinOps  ADD, ADD, $Rptr, $Rptr, (:INDEX:DrvRecs), $cond
+         MEND
+ 
+ 
+diff --git "a/Sources/FileSys/FileCore/s/InitDieSvc" "b/Sources/FileSys/FileCore/s/InitDieSvc"
+index ee0266b..195fbf5 100644
+--- "a/Sources/FileSys/FileCore/s/InitDieSvc"
++++ "b/Sources/FileSys/FileCore/s/InitDieSvc"
+@@ -339,8 +339,17 @@ InitEntry ROUT          ; NO REENTRANCY CHECK NEEDED
+         BL      UnlockDirCache
+ 
+ ;initialise Drive & disc records, ptrs to Free space Maps and defect lists
+-        sbaddr  R4, DrvRecs
+-        sbaddr  R5, DiscRecs
++        ; M3a phase 2: claim the drive + disc record tables as one RMA block
++        ; (sized for MaxDrives), lifting them out of the <&1000 static workspace.
++        MOV     R3, #MaxDrives*(SzDrvRec+SzDiscRec)
++        MOV     R0, #ModHandReason_Claim
++        SWI     XOS_Module
++        BVS     %FT95                   ; propagate claim failure (as for workspace)
++        STR     R2, DrvRecsPtr          ; drive records first
++        ADD     R4, R2, #MaxDrives*SzDrvRec
++        STR     R4, DiscRecsPtr         ; disc records follow
++        MOV     R4, R2                  ; R4 -> drive records (for the init loop)
++        LDR     R5, DiscRecsPtr         ; R5 -> disc records
+         ASSERT  SzDefectList=&200
+ 
+         MOV     R2, #0          ;ctr
+@@ -699,6 +708,13 @@ DieEntry
+         ADRNE   R0, message_file_block
+         SWINE   XMessageTrans_CloseFile ; Ignore error from this
+ 
++        ; M3a phase 2: free the drive/disc record table block (before the workspace,
++        ; whose DrvRecsPtr we still need to read).
++        LDR     R2, DrvRecsPtr
++        TEQ     R2, #0
++        MOVNE   R0, #ModHandReason_Free
++        SWINE   XOS_Module          ;ignore errors
++
+         MOV     R0, #ModHandReason_Free
+         MOV     R2, SB
+         SWI     XOS_Module          ;Free workspace
+diff --git "a/Sources/FileSys/FileCore/s/Commands" "b/Sources/FileSys/FileCore/s/Commands"
+index 1242c9c..8690fac 100644
+--- "a/Sources/FileSys/FileCore/s/Commands"
++++ "b/Sources/FileSys/FileCore/s/Commands"
+@@ -2392,7 +2392,8 @@ Dismount_Code ROUT
+ 
+         MOV     R2, #0          ;clear error flag
+         MOV     R3, #0
+-        sbaddr  R4, DiscRecs+DiscRecord_DiscName
++        LDR     R4, DiscRecsPtr                 ; M3a: disc records are now dynamic
++        ADD     R4, R4, #DiscRecord_DiscName
+ 30
+         LDRB    LR, [R4,#Priority - DiscRecord_DiscName]
+         TEQS    LR, #0
+diff --git "a/Sources/FileSys/FileCore/s/FileCore40" "b/Sources/FileSys/FileCore/s/FileCore40"
+index 004960f..29aacd9 100644
+--- "a/Sources/FileSys/FileCore/s/FileCore40"
++++ "b/Sources/FileSys/FileCore/s/FileCore40"
+@@ -898,7 +898,8 @@ FindDiscByName
+ 
+ 07
+         MOV     R3, #0
+-        sbaddr  R4, DiscRecs+DiscRecord_DiscName
++        LDR     R4, DiscRecsPtr                 ; M3a: disc records are now dynamic
++        ADD     R4, R4, #DiscRecord_DiscName
+ 
+         ; These bits are used to indicate which sort of root directory
+         ; has been found:
