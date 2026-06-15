@@ -5,6 +5,11 @@ linked/
 *.o
 *.obj
 
+# gfcref reference tool artefacts
+tools/gfcref/gfctool
+tools/gfcref/gfctool.exe
+*.img
+
 # Editor / OS cruft
 *~
 .DS_Store
