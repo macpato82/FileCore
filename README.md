@@ -43,7 +43,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1j** | Lazy AG init + global free counter (16 EB-class format) | ✅ done |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
-| **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build-verified on RPCEmu (assembles + links, 0 errors) |
+| **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build- **and runtime**-verified on RPCEmu |
 | **M3b/c** | Drive-number widening (record index + address routing) | ✅ drafted (build pending) |
 | M4 | G-format read support in FileCore (ARM) | planned |
 | M5 | G-format write / allocation (ARM) | planned |
@@ -54,12 +54,15 @@ The host-side reference (`tools/gfcref`) already formats G-format images, stores
 files, integrity-checks the map against object extents, and journals/rewinds changes — all
 verified off-target.
 
-**ARM build pipeline is live.** The real FileCore module builds from source in RPCEmu using the
-Acorn DDE (RISC OS 5 / IOMD, APCS-32) — to `rm.IOMD.FileCore`. **M3a is build-verified**: the
-dynamic drive/disc record tables (pointerised access, then an RMA-claimed block freed on Die)
-assemble and link with 0 errors. The verified change is [`patches/m3a.diff`](patches/m3a.diff).
-Next: runtime test (boot + mount) and the M3b/M3c drive-number widening that lets `MaxDrives`
-exceed 8.
+**ARM build pipeline is live, and M3a is runtime-verified.** The real FileCore module builds from
+source in RPCEmu using the Acorn DDE (RISC OS 5 / IOMD, APCS-32) — to `rm.IOMD.FileCore` and a
+softloadable `rm.IOMD.FileCoreSA`. **M3a** (dynamic drive/disc record tables: pointerised access,
+then an `OS_Module`-claimed RMA block freed on Die — [`patches/m3a.diff`](patches/m3a.diff))
+assembles + links with 0 errors **and runs**: softloaded over the ROM FileCore in a live RISC OS,
+ADFS re-creates its instance and `FileCore_Create` runs the new record-table claim/init cleanly
+with the desktop still up. Next: M3b/M3c drive-number widening (the `DrvsDisc` byte is overloaded —
+record-number XOR flag-state disambiguated by `< 8` — so widening past 8 is a behaviour-changing
+rewrite, now backed by this runtime-test loop).
 
 ## Reference tool
 
