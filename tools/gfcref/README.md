@@ -78,6 +78,16 @@ rewound 1 transaction(s), restored 4 write record(s); journal now ends before tx
 Verified: after `rewind` the image is **byte-identical** (SHA-256) to its pre-transaction
 state and `check` still passes; repeated `rewind` fully unwinds to the formatted disc.
 
+## Tests
+
+`tests/regress.ps1` is a reproducible regression + stress suite (38 checks): CRUD round-trips,
+cross-AG multi-extent files, delete/reuse, nested directories, journal/rewind, corruption
+detection, intra-AG fragmentation (a file threaded through punched holes), and a 60-op randomized
+create/delete stress run that re-verifies `check` after every step and reads back every survivor.
+```
+pwsh tools/gfcref/tests/regress.ps1     # exits non-zero on any failure
+```
+
 ## Files
 - `gfc.h` — on-disc offsets, magics, geometry struct, little-endian accessors.
 - `gfc_check.c` — check-byte algorithms ported from the FileCore sources.

@@ -36,6 +36,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M1c** | Multi-extent, cross-AG files + `read` | ✅ done |
 | **M1d** | `delete` (cross-AG free + reuse, journalled) | ✅ done |
 | **M1e** | Subdirectories, paths (`mkdir`), recursive `check` | ✅ done |
+| **M1f** | Regression + fragmentation + randomized stress suite | ✅ done (38 checks) |
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables — implementation patch | ✅ drafted (build-unverified) |

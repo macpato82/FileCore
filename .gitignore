@@ -22,3 +22,4 @@ desktop.ini
 tools/gfcref/*.txt
 tools/gfcref/*.bin
 *.gfcjrnl
+tools/gfcref/tests/_work/
