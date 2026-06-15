@@ -59,17 +59,24 @@ verified off-target before any ARM-assembler work begins.
 
 ```
 gfctool format  <image> [--size N] [--sector N] [--ag-size N] [--bpmb N] [--name STR]
-gfctool mkfile  <image> <name> <srcfile>    # journalled
-gfctool ls      <image>
+gfctool mkfile  <image> <path> <srcfile>    # journalled; multi-extent, cross-AG
+gfctool read    <image> <path> <outfile>
+gfctool delete  <image> <path>              # rmdir if empty
+gfctool mkdir   <image> <path>
+gfctool rename  <image> <oldpath> <newpath>
+gfctool ls      <image> [path]              # paths use '/' (-> RISC OS '.')
 gfctool journal <image>
 gfctool rewind  <image> [--to TXN]
 gfctool check   <image>
 gfctool info    <image>
+gfctool free    <image>
 ```
 
-`check` verifies the decisive invariant — allocated map bits == structural-reserved ∪ every
-object extent (no leaks/overlaps) — and `rewind` restores a byte-identical earlier disc state
-(confirmed by SHA-256). Build with `make` (gcc/MinGW).
+A working mini-filesystem: files fragment into extents across allocation groups, a full
+directory tree, journalled mutations with `rewind`, and superblock recovery from the secondary
+copy. `check` verifies the decisive invariant disc-wide — each AG's allocated map == reserved ∪
+every object's clusters (no leaks/overlaps) — and `rewind` restores a byte-identical earlier state
+(SHA-256). Reproducible suite: `pwsh tools/gfcref/tests/regress.ps1` (46 checks). Build: `make` (gcc/MinGW).
 
 ## Layout
 
