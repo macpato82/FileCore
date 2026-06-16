@@ -44,8 +44,8 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M2** | Journaling hooks spec + working `rewind` reference | ✅ done |
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build- **and runtime**-verified on RPCEmu (mount + file copy on a real disc) |
-| **M3b** | Drive-number widening (DrvsDisc index) | 🔨 phase b.0 (record→40, ×40 macro) build+runtime-verified; b.1 (migrate number + rework `<8` disambiguation) pending |
-| **M3c** | DiscOp64 drive routing in GenIndDiscOp | ✅ drafted (design/07) |
+| **M3b.0** | Drive Record → 40 bytes (room for full-width index) | ✅ build+runtime-verified |
+| **M3b.1 / M3c** | Index migration + DiscOp64 drive routing → `MaxDrives`>8 | ⏸️ deferred — to be done as one coordinated effort (see design/07 §6) |
 | M4 | G-format read support in FileCore (ARM) | planned |
 | M5 | G-format write / allocation (ARM) | planned |
 | M6 | Format/layout SWIs + ADFS/SCSIFS integration | planned |
@@ -63,13 +63,14 @@ assembles + links with 0 errors **and runs**: softloaded over the ROM FileCore i
 a 1600K ADFS floppy **mounts and copies files**. (Runtime testing earned its keep here: assemble +
 ADFS-init looked green, but a real mount exposed a register-corruption bug — the `OS_Module` claim
 trashed `R7`/`R8`, the floppy/winnie drive-existence bounds the init loop relies on, so every drive
-was marked absent and mounts failed `BadDrive`. Fixed by preserving them across the SWI.) **M3b** is underway: phase b.0 (Drive Record grown to 40 bytes for a future full-width
-disc-record index, `DrvRecPtr` ×40) is build+runtime-verified; phase b.1 (migrate the index out
-of the overloaded `DrvsDisc` byte — record-number XOR flag-state disambiguated by `< 8` — and
-rework that disambiguation) is paused at a checkpoint. b.1's "has-record" path wants a *mounted*
-FileCore disc to fully runtime-test, which is awkward in this RO5/RPCEmu setup (`.adf` floppy
-mounting is broken under RO5, the IDE image is empty, RAMFS needs a reset). WIP diff:
-[`patches/m3b-progress.diff`](patches/m3b-progress.diff).
+was marked absent and mounts failed `BadDrive`. Fixed by preserving them across the SWI.) **M3b.0** (Drive Record grown to 40 bytes for a future full-width disc-record index, `DrvRecPtr`
+×40) is build+runtime-verified — WIP diff [`patches/m3b-progress.diff`](patches/m3b-progress.diff).
+**M3b.1 / M3c are deferred** as one coordinated effort: the index *storage* widening buys nothing
+until the index *source* (the 3-bit field in disc addresses) is widened too, and migrating the
+overloaded `DrvsDisc` byte in isolation proved fragile (a first attempt regressed at runtime, since
+`DrvsDisc & 7` already serves as the number/0 the reads expect, and a separate byte must be kept in
+lockstep at every write site). See [design/07 §6](design/07-M3bc-DriveNumberWidening.md) for the
+full lesson and the holistic plan. The stable, runtime-verified foundation (M3a + M3b.0) stands.
 
 ## Reference tool
 

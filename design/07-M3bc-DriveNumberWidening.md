@@ -126,3 +126,29 @@ The drive is squeezed into bits 29-31 of the 32-bit `R2` handed to `DoDiscOp` �
 - RPCEmu: mount/read/write/dismount on ≤ 8 drives (legacy path) unchanged.
 - With a DiscOp64-capable low-level FS and `MaxDrives>8`: exercise a drive index ≥ 8 end-to-end.
 - Confirm `DrvsDiscNum` and the state-flag bits never alias (grep the number-site sweep is complete).
+
+## 6. Implementation note / lesson learned (2026-06-15)
+
+A first attempt at **M3b.1 in isolation** (introduce `DrvsDiscNum` and migrate the index off
+`DrvsDisc`, *without* M3c) regressed at runtime: mounting an ADFS floppy failed `BadDrive`.
+
+Root cause and the key insight for whoever does the coordinated effort:
+
+- **`DrvsDisc & 7` is already exactly the value `DrvsDiscNum` should hold** — the disc-record
+  number when a disc is attached, and **0** otherwise (the flag values `Full`/`Empty`/`Unknown`/
+  `Uncertain` occupy bits 4–7, so their low 3 bits are 0). The legacy `AND #7` / `BIC Uncertain;
+  CMP #8` reads rely on this.
+- Therefore a *separate* `DrvsDiscNum` must be kept in lockstep with `DrvsDisc & 7` at **every one
+  of the ~7 `DrvsDisc`-write sites** (`FileCore20` 470/845/552/2072/2478, `Commands` ~2451,
+  `InitDieSvc` init), several of them **conditional**. Syncing only the two number-writes leaves
+  `DrvsDiscNum` **stale after a disc detaches**, so a later re-identify reads the wrong disc record.
+  Each companion write also needs a genuinely-free scratch register (cf. the M3a `R7`/`R8` bug).
+- **M3b.1 buys nothing until M3c also widens the number's *source*** (the 3-bit field in disc
+  addresses: `FcbIndDiscAdd` top 3 bits, `GenIndDiscOp`'s `LSR/ORR #(32-3)`, the `EOR #4` drive
+  encoding). Until then the index can't exceed 7 regardless of storage width.
+
+**Conclusion:** do **not** land the storage migration on its own. Treat M3b.1 + M3c + the
+disc-address-field widening as a single coordinated "raise `MaxDrives` > 8" change, validated with
+a real `MaxDrives>8` + DiscOp64 low-level FS scenario (not just the legacy ≤ 8 path). The M3a
+dynamic tables and the `SzDrvRec=40` record growth (M3b.0) are the stable, runtime-verified
+foundation that change builds on.
