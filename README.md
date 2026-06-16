@@ -46,7 +46,7 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build- **and runtime**-verified on RPCEmu (mount + file copy on a real disc) |
 | **M3b.0** | Drive Record → 40 bytes (room for full-width index) | ✅ build+runtime-verified |
-| **M3b.1 / M3c** | Index migration + DiscOp64 drive routing → `MaxDrives`>8 | ⏸️ deferred — to be done as one coordinated effort (see design/07 §6) |
+| **M3b.1 / M3c** | Index migration + DiscOp64 drive routing → `MaxDrives`>8 | 🔨 Phase A (index→`DrvsDiscNum`) build+runtime-verified at `MaxDrives=8`; B–D (disambiguation, DiscOp64 routing, "8" sentinel rework, bump) in progress (>8 paths assemble-verified — RPCEmu can't present >8 drives) |
 | M4 | G-format read support in FileCore (ARM) | planned |
 | M5 | G-format write / allocation (ARM) | planned |
 | M6 | Format/layout SWIs + ADFS/SCSIFS integration | planned |

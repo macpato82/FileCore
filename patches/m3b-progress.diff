@@ -1,8 +1,8 @@
-# M3 ARM work-in-progress (build + RUNTIME verified on RPCEmu/RO5 via softload).
-# = M3a (dynamic record tables, complete; incl. the register-preservation fix so
-#   mounts work - R7/R8 preserved across the OS_Module claim) + M3b.0 (Drive Record
-#   grown to 40 for the future full-width disc-record index; DrvRecPtr x40).
-#   Verified: floppy mount + file copy work on the patched FileCore. M3b.1 pending.
+# M3 ARM work-in-progress (build-verified; ROM-runtime-verified at MaxDrives=8 via softload).
+# = M3a (dynamic record tables) + M3b.0 (Drive Record -> 40, DrvRecPtr x40)
+#   + M3b.1 Phase A: disc-record index mirrored into DrvsDiscNum at every number-changing
+#     write site (invariant DrvsDiscNum == DrvsDisc & 7); index reads source from DrvsDiscNum.
+#     Behaviour-identical at MaxDrives=8 (floppy mount verified). Phases B-D follow.
 diff --git "a/Sources/FileSys/FileCore/s/Defns" "b/Sources/FileSys/FileCore/s/Defns"
 index 98df71c..7041081 100644
 --- "a/Sources/FileSys/FileCore/s/Defns"
@@ -159,7 +159,7 @@ index 24e9964..eba8fad 100644
  
  
 diff --git "a/Sources/FileSys/FileCore/s/InitDieSvc" "b/Sources/FileSys/FileCore/s/InitDieSvc"
-index ee0266b..0f4bcd5 100644
+index ee0266b..3f17036 100644
 --- "a/Sources/FileSys/FileCore/s/InitDieSvc"
 +++ "b/Sources/FileSys/FileCore/s/InitDieSvc"
 @@ -339,8 +339,23 @@ InitEntry ROUT          ; NO REENTRANCY CHECK NEEDED
@@ -188,7 +188,15 @@ index ee0266b..0f4bcd5 100644
          ASSERT  SzDefectList=&200
  
          MOV     R2, #0          ;ctr
-@@ -699,6 +714,13 @@ DieEntry
+@@ -358,6 +373,7 @@ InitEntry ROUT          ; NO REENTRANCY CHECK NEEDED
+         MOV     LR, #Uncertain :OR: Unknown
+         STRB    LR, [R4,#DrvsDisc]
+         MOV     LR, #0
++        STRB    LR, [R4, #DrvsDiscNum]  ; M3b.1: no disc record yet (DrvsDisc & 7 == 0)
+         STRB    LR, [R4, #DrvFlags]
+         STRB    LR, [R4, #LockCount]
+         STR     LR, [R4,#ChangedSeqNum]
+@@ -699,6 +715,13 @@ DieEntry
          ADRNE   R0, message_file_block
          SWINE   XMessageTrans_CloseFile ; Ignore error from this
  
@@ -203,9 +211,18 @@ index ee0266b..0f4bcd5 100644
          MOV     R2, SB
          SWI     XOS_Module          ;Free workspace
 diff --git "a/Sources/FileSys/FileCore/s/Commands" "b/Sources/FileSys/FileCore/s/Commands"
-index 1242c9c..8690fac 100644
+index 1242c9c..255283c 100644
 --- "a/Sources/FileSys/FileCore/s/Commands"
 +++ "b/Sources/FileSys/FileCore/s/Commands"
+@@ -403,7 +403,7 @@ BackupPromptDestDisc
+         ;     Read disc record for dest disc
+         LDRB    lr, [r11, #DestDrv]
+         DrvRecPtr lr, lr
+-        LDRB    lr, [lr, #DrvsDisc]
++        LDRB    lr, [lr, #DrvsDiscNum]  ; M3b.1: disc-record number in its own byte
+         DiscRecPtr lr, lr
+ 
+         ;     If dest disc same complain about same-discness
 @@ -2392,7 +2392,8 @@ Dismount_Code ROUT
  
          MOV     R2, #0          ;clear error flag
@@ -216,6 +233,15 @@ index 1242c9c..8690fac 100644
  30
          LDRB    LR, [R4,#Priority - DiscRecord_DiscName]
          TEQS    LR, #0
+@@ -2448,6 +2449,8 @@ DriveContentsUnknown
+         DrvRecPtr r0, r0
+         MOV     lr, #Uncertain :OR: Unknown
+         STRB    lr, [r0, #DrvsDisc]
++        AND     lr, lr, #7              ; M3b.1: DrvsDiscNum mirrors DrvsDisc & 7 (== 0, no record)
++        STRB    lr, [r0, #DrvsDiscNum]
+         LDRB    lr, [r0, #DrvFlags]
+         BIC     lr, lr, #LastDiscOpWasFormat
+         STRB    lr, [r0, #DrvFlags]
 diff --git "a/Sources/FileSys/FileCore/s/FileCore40" "b/Sources/FileSys/FileCore/s/FileCore40"
 index 004960f..29aacd9 100644
 --- "a/Sources/FileSys/FileCore/s/FileCore40"
@@ -230,3 +256,65 @@ index 004960f..29aacd9 100644
  
          ; These bits are used to indicate which sort of root directory
          ; has been found:
+diff --git "a/Sources/FileSys/FileCore/s/FileCore20" "b/Sources/FileSys/FileCore/s/FileCore20"
+index 63b008b..9a2950d 100644
+--- "a/Sources/FileSys/FileCore/s/FileCore20"
++++ "b/Sources/FileSys/FileCore/s/FileCore20"
+@@ -468,6 +468,7 @@ DetermineDiscType ROUT
+ 
+         ; attach found disc to this drive
+         STRB    r2, [r4, #DrvsDisc]
++        STRB    r2, [r4, #DrvsDiscNum]  ; M3b.1: mirror disc-record number into its own byte
+         STRB    r1, [r5, #DiscsDrv]
+ 
+   [ DebugL
+@@ -842,6 +843,7 @@ MountDiscOnDrive ROUT
+         DREG    r2, "DrvsDisc set to "
+  ]
+         STRB    r2, [r4, #DrvsDisc]
++        STRB    r2, [r4, #DrvsDiscNum]  ; M3b.1: mirror disc-record number into its own byte
+         ASSERT  DiscRecord_DiscName = DiscRecord_DiscId + 2
+         STR     r0, [r5, #DiscRecord_DiscId]
+         STR     r0, [r5, #DiscRecord_DiscName+2]
+@@ -2068,6 +2070,8 @@ PollChange ROUT
+         ; then mark the disc as full and uncertain
+         MOVNE   R1, #Full :OR: Uncertain
+         STRB    R1, [R4,#DrvsDisc]
++        AND     R1, R1, #7              ; M3b.1: DrvsDiscNum mirrors DrvsDisc & 7
++        STRB    R1, [R4,#DrvsDiscNum]
+         STR     R2, [R4,#ChangedSeqNum]
+ 
+ 85
+@@ -2474,6 +2478,8 @@ UnlinkCommon
+         BIC     R0, R0,#Uncertain       ; Disc may be uncertain
+         MOV     R2, #Uncertain :OR: Unknown
+         STRB    R2, [R1, #DrvsDisc]     ;drive contents unknown and uncertain
++        AND     R2, R2, #7              ; M3b.1: DrvsDiscNum mirrors DrvsDisc & 7 (== 0, no record)
++        STRB    R2, [R1, #DrvsDiscNum]
+         MOV     R2, #8
+         STRB    R2, [LR, #DiscsDrv]     ;disc in unknown drive
+ 
+diff --git "a/Sources/FileSys/FileCore/s/FileCore30" "b/Sources/FileSys/FileCore/s/FileCore30"
+index 9e0476d..e89f2d3 100644
+--- "a/Sources/FileSys/FileCore/s/FileCore30"
++++ "b/Sources/FileSys/FileCore/s/FileCore30"
+@@ -973,8 +973,7 @@ FindErrBlock ROUT
+ 
+         EOR     r0,r0,#4                ; external to internal
+         DrvRecPtr lr,r0
+-        LDRB    lr, [lr,#DrvsDisc]
+-        AND     lr, lr, #7
++        LDRB    lr, [lr,#DrvsDiscNum]   ; M3b.1: disc-record number in its own byte
+         DiscRecPtr lr, lr
+ 
+ 
+@@ -1385,8 +1384,7 @@ InternalFromParent
+         BIC     R4, R4, #DiscBits
+         EOR     LR, R3, #4
+         DrvRecPtr LR, LR
+-        LDRB    LR, [LR, #DrvsDisc]
+-        AND     LR, LR, #7
++        LDRB    LR, [LR, #DrvsDiscNum]  ; M3b.1: disc-record number in its own byte
+         DiscRecPtr LR, LR
+         LDRB    R3, [LR, #DiscRecord_Log2SectorSize]
+         RSB     R0, R3, #32
