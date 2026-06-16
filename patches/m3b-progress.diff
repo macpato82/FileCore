@@ -1,8 +1,10 @@
 # M3 ARM work-in-progress (build-verified; ROM-runtime-verified at MaxDrives=8 via softload).
-# = M3a (dynamic record tables) + M3b.0 (Drive Record -> 40, DrvRecPtr x40)
-#   + M3b.1 Phase A: disc-record index mirrored into DrvsDiscNum at every number-changing
-#     write site (invariant DrvsDiscNum == DrvsDisc & 7); index reads source from DrvsDiscNum.
-#     Behaviour-identical at MaxDrives=8 (floppy mount verified). Phases B-D follow.
+# = M3a + M3b.0 + M3b.1 Phase A (index -> DrvsDiscNum, invariant DrvsDiscNum == DrvsDisc & 7)
+#   + Phase B (two standalone has-record tests reworked from "< 8" to a Unknown/Empty/Full flag
+#     test, number sourced from DrvsDiscNum: FileCore15 dismount, FileCore20 density).
+#   Behaviour-identical at MaxDrives=8 (floppy mount + read + copy verified). Remaining for >8:
+#   DiscsDrv "= 8" no-attach sentinel, hardcoded 0..7 drive/disc-record loops, UnlinkCommon,
+#   InitDieSvc consistency loop, M3c GenIndDiscOp routing, MaxDrives bump (see below / design).
 diff --git "a/Sources/FileSys/FileCore/s/Defns" "b/Sources/FileSys/FileCore/s/Defns"
 index 98df71c..7041081 100644
 --- "a/Sources/FileSys/FileCore/s/Defns"
@@ -257,7 +259,7 @@ index 004960f..29aacd9 100644
          ; These bits are used to indicate which sort of root directory
          ; has been found:
 diff --git "a/Sources/FileSys/FileCore/s/FileCore20" "b/Sources/FileSys/FileCore/s/FileCore20"
-index 63b008b..9a2950d 100644
+index 63b008b..e81d0d0 100644
 --- "a/Sources/FileSys/FileCore/s/FileCore20"
 +++ "b/Sources/FileSys/FileCore/s/FileCore20"
 @@ -468,6 +468,7 @@ DetermineDiscType ROUT
@@ -268,6 +270,23 @@ index 63b008b..9a2950d 100644
          STRB    r1, [r5, #DiscsDrv]
  
    [ DebugL
+@@ -700,11 +701,11 @@ MountDiscOnDrive ROUT
+  ]
+ 
+         ; Get density of disc currently (but not for much longer) attached to drive
+-        LDRB    r8, [r4, #DrvsDisc]
+-        BIC     r8, r8, #Uncertain
+-        CMP     r8, #8
+-        MOVHS   r8, #0                  ; Start at Density=0 if no valid disc previously attached
+-        BHS     %FT10
++        LDRB    r8, [r4, #DrvsDisc]                  ; M3b.1: has-record iff no Unknown/Empty/Full
++        TST     r8, #Unknown :OR: Empty :OR: Full
++        MOVNE   r8, #0                  ; Start at Density=0 if no valid disc previously attached
++        BNE     %FT10
++        LDRB    r8, [r4, #DrvsDiscNum]               ; record number now lives in DrvsDiscNum
+ 
+  [ DebugL
+         DREG    r8, "Old disc attached to drive:"
 @@ -842,6 +843,7 @@ MountDiscOnDrive ROUT
          DREG    r2, "DrvsDisc set to "
   ]
@@ -318,3 +337,22 @@ index 9e0476d..e89f2d3 100644
          DiscRecPtr LR, LR
          LDRB    R3, [LR, #DiscRecord_Log2SectorSize]
          RSB     R0, R3, #32
+diff --git "a/Sources/FileSys/FileCore/s/FileCore15" "b/Sources/FileSys/FileCore/s/FileCore15"
+index 8382f7f..94b78d8 100644
+--- "a/Sources/FileSys/FileCore/s/FileCore15"
++++ "b/Sources/FileSys/FileCore/s/FileCore15"
+@@ -719,10 +719,10 @@ RetryDriveOp ROUT
+ 
+         ; Dismount the disc attached to the drive
+         Push    "r0,r1"
+-        LDRB    r1, [r0, #DrvsDisc]
+-        BIC     r1, r1, #Uncertain
+-        CMP     r1, #7
+-        BLLS    ActiveDismountDisc
++        LDRB    r1, [r0, #DrvsDisc]                  ; M3b.1: has-record iff no Unknown/Empty/Full
++        TST     r1, #Unknown :OR: Empty :OR: Full
++        LDREQB  r1, [r0, #DrvsDiscNum]               ; record number now lives in DrvsDiscNum
++        BLEQ    ActiveDismountDisc
+         Pull    "r0,r1"
+         CLRV
+ 
