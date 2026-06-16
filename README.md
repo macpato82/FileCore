@@ -46,7 +46,8 @@ bitmap code), widens object ids to ≥40 bits, and uses 64-bit sector addressing
 | **M3** | 256-drive support — gap analysis & change design | ✅ done |
 | **M3a** | Dynamic drive/disc record tables (ARM) | ✅ build- **and runtime**-verified on RPCEmu (mount + file copy on a real disc) |
 | **M3b.0** | Drive Record → 40 bytes (room for full-width index) | ✅ build+runtime-verified |
-| **M3b.1 / M3c** | Index migration + DiscOp64 drive routing → `MaxDrives`>8 | 🔨 Phase A (index→`DrvsDiscNum`) build+runtime-verified at `MaxDrives=8`; B–D (disambiguation, DiscOp64 routing, "8" sentinel rework, bump) in progress (>8 paths assemble-verified — RPCEmu can't present >8 drives) |
+| **M3b.1** | Disc-record index → `DrvsDiscNum` (off the overloaded byte) | ✅ Phase A+B build+runtime-verified at `MaxDrives=8` |
+| **M3c / >8** | `DiscsDrv` sentinel + loops + DiscOp64 drive routing + `MaxDrives` bump | 📋 fully specced (design/12) — atomic ~30-site sweep, needs a >8 test harness |
 | M4 | G-format read support in FileCore (ARM) | planned |
 | M5 | G-format write / allocation (ARM) | planned |
 | M6 | Format/layout SWIs + ADFS/SCSIFS integration | planned |
@@ -119,6 +120,7 @@ tools/armcheck/ Host-side verifier for the ARM patch address arithmetic
 - [`design/09-Directories-v1.md`](design/09-Directories-v1.md) — subdirectories, paths, recursive `check`.
 - [`design/10-LazyAG-v1.md`](design/10-LazyAG-v1.md) — lazy AG init + global free counter (16 EB-class).
 - [`design/11-MultiClusterDirs-v1.md`](design/11-MultiClusterDirs-v1.md) — multi-cluster (extent-backed) directories.
+- [`design/12-MaxDrives256-Sweep.md`](design/12-MaxDrives256-Sweep.md) — complete `MaxDrives>8` change sweep (sentinel, loops, M3c, bump).
 
 ## License
 
