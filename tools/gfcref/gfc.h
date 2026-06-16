@@ -15,7 +15,7 @@
 #define GFC_AGH_MAGIC      0x47414647u   /* "GFAG" LE */
 #define GFC_DISC_VERSION   0x47314644u   /* distinct value so legacy tools refuse */
 #define GFC_FMT_MAJOR      1
-#define GFC_FMT_MINOR      0
+#define GFC_FMT_MINOR      1   /* multi-cluster (extent-backed) directories */
 
 #define GFC_DISCTYPE_DATA  0xFFD         /* FileType_Data */
 #define GFC_OBJID_LOCALBITS 15

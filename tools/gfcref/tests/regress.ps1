@@ -150,6 +150,37 @@ G read $imgS big.bin "$wd\sp.out" | Out-Null
 Ok ((Hash "$wd\sp.bin") -eq (Hash "$wd\sp.out")) "lazy spill across on-demand AGs reads identical"
 Ok ((G check $imgS) -eq 0) "check lazy spill"
 
+Write-Host "`n[13] multi-cluster directories (extent-backed; design/11)"
+$imgM = Join-Path $wd "mc.img"
+Ok ((G format $imgM --size 8M --sector 512 --bpmb 512 --name MCDIR) -eq 0) "format 512B-cluster (~12 entries/cluster)"
+MakeFile "$wd\m.bin" 200
+1..40 | ForEach-Object { G mkfile $imgM ("f{0:d2}" -f $_) "$wd\m.bin" | Out-Null }
+$mc = (& $g ls $imgM 2>$null | Select-String '^  f\d').Count
+Ok ($mc -eq 40) "root dir holds 40 entries across multiple clusters (got $mc)"
+Ok ((G check $imgM) -eq 0) "check: dir data clusters in the map union"
+Ok ((G read $imgM f37 "$wd\m.out") -eq 0) "read late entry (find across dir clusters)"
+Ok ((Hash "$wd\m.bin") -eq (Hash "$wd\m.out")) "late-entry content identical"
+1..8 | ForEach-Object { G delete $imgM ("f{0:d2}" -f ($_*3)) | Out-Null }
+$mc2 = (& $g ls $imgM 2>$null | Select-String '^  f\d').Count
+Ok ($mc2 -eq 32) "after deleting 8 scattered entries: 32 remain (got $mc2)"
+Ok ((G check $imgM) -eq 0) "check after multi-cluster deletes"
+Ok ((G mkdir $imgM d) -eq 0) "mkdir d"
+1..25 | ForEach-Object { G mkfile $imgM ("d/g{0:d2}" -f $_) "$wd\m.bin" | Out-Null }
+$sc = (& $g ls $imgM d 2>$null | Select-String '^  g\d').Count
+Ok ($sc -eq 25) "subdir spans multiple clusters: 25 entries (got $sc)"
+Ok ((G read $imgM d/g23 "$wd\g.out") -eq 0) "read across subdir clusters"
+Ok ((Hash "$wd\m.bin") -eq (Hash "$wd\g.out")) "subdir entry content identical"
+Ok ((G check $imgM) -eq 0) "recursive check with multi-cluster subdir"
+$imgR = Join-Path $wd "mcr.img"
+G format $imgR --size 8M --sector 512 --bpmb 512 --name MCRW | Out-Null
+1..12 | ForEach-Object { G mkfile $imgR ("h{0:d2}" -f $_) "$wd\m.bin" | Out-Null }
+$pre = Hash $imgR
+G mkfile $imgR h13 "$wd\m.bin" | Out-Null     # this entry grows the root dir into a 2nd cluster
+Ok ((Hash $imgR) -ne $pre) "dir-growth transaction changed the image"
+G rewind $imgR | Out-Null
+Ok ((Hash $imgR) -eq $pre) "rewind of dir-growth restores byte-identical image"
+Ok ((G check $imgR) -eq 0) "check after rewind of dir growth"
+
 Write-Host "`n================  $pass passed, $fail failed  ================"
 Remove-Item -Recurse -Force $wd
 if ($fail -gt 0) { exit 1 } else { exit 0 }

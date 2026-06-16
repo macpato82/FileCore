@@ -215,8 +215,8 @@ static void build_obj_header(uint8_t *c, uint64_t objid, uint8_t type, uint8_t a
 /* build an empty root directory object into a freshly zeroed cluster buffer */
 static void build_root_object(uint8_t *c, uint32_t cluster_size, uint64_t objid, uint64_t start_sector){
     memset(c,0,cluster_size);
-    build_obj_header(c,objid,OBJ_TYPE_DIR,0,0,0,0,4,start_sector,1,"$");
-    put_u32(c+OBJ_HDR_BYTES,0);   /* EntryCount = 0 */
+    /* empty extent-backed directory: no data extents/clusters, zero length (design/11) */
+    build_obj_header(c,objid,OBJ_TYPE_DIR,0,0,0,0,0,start_sector,0,"$");
 }
 
 /* ---- cross-AG cluster allocation ----
@@ -405,21 +405,80 @@ static void free_clusters(FILE *f, const gfc_geom *g, const uint64_t *secs, int 
     free(map); free(h);
 }
 
-/* ---- directory navigation (paths use '/' ; maps to RISC OS '.') ---- */
+/* ---- directory navigation (paths use '/' ; maps to RISC OS '.') ----
+ *
+ * A directory is extent-backed like a file (design/11): its header cluster holds the
+ * object record + extent table, and its entries are a contiguous byte stream of
+ * DIRENT_BYTES records spread across the data clusters. EntryCount = OBJ_Length /
+ * DIRENT_BYTES. An empty directory has no extents (ExtentCount = ClusterCount = 0). */
+
+/* load a directory's entries into a malloc'd buffer (walks the extent table).
+ * returns the entry count; *out = malloc(count*DIRENT_BYTES) or NULL if empty. */
+static uint32_t dir_load(FILE *f, const gfc_geom *g, uint64_t hdr_sec, uint8_t **out){
+    uint32_t cb=1u<<g->log2_bpmb;
+    uint8_t *hc=calloc(1,cb); read_run(f,g,hdr_sec,1,hc);
+    uint64_t length=get_u64(hc+OBJ_Length), dcl=get_u64(hc+OBJ_ClusterCount);
+    uint16_t nx=get_u16(hc+OBJ_ExtentCount);
+    uint32_t nent=(uint32_t)(length/DIRENT_BYTES);
+    if (!nent || !nx || !dcl){ free(hc); if(out)*out=NULL; return 0; }
+    uint8_t *stream=calloc((size_t)dcl,cb); uint64_t off=0;
+    for (uint16_t x=0;x<nx;x++){
+        uint64_t es=get_u64(hc+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_StartSector);
+        uint64_t ec=get_u64(hc+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_ClusterCount);
+        for (uint64_t k=0;k<ec && off<dcl;k++) read_run(f,g,es+(k<<g->log2_secs_per_clu),1,stream+(off++)*cb);
+    }
+    if (out){ *out=malloc((size_t)nent*DIRENT_BYTES); memcpy(*out,stream,(size_t)nent*DIRENT_BYTES); }
+    free(stream); free(hc); return nent;
+}
+
+/* write `nent` entries back to directory `hdr_sec`, growing data clusters as needed
+ * (cross-AG, journalled) and updating the header's extent table / counts / length.
+ * adjusts the global free counter for any newly-allocated clusters. 0 ok, -1 no space. */
+static int dir_store(FILE *f, const gfc_geom *g, uint64_t hdr_sec, const uint8_t *entries, uint32_t nent){
+    uint32_t cb=1u<<g->log2_bpmb; int max_ext=(cb-OBJ_HDR_BYTES)/EXTENT_BYTES;
+    uint8_t *hc=calloc(1,cb); read_run(f,g,hdr_sec,1,hc);
+    uint64_t bytes=(uint64_t)nent*DIRENT_BYTES, need=ceil_div(bytes,cb);
+    uint64_t have=get_u64(hc+OBJ_ClusterCount); uint16_t nx=get_u16(hc+OBJ_ExtentCount);
+    if (need>have){
+        uint64_t add=need-have;
+        if (total_free_clusters(f,g)<add){ free(hc); return -1; }
+        extent_t *ne=malloc((size_t)max_ext*sizeof *ne); int nn=0;
+        if (alloc_clusters(f,g,add,ne,&nn,max_ext-nx)){ free(ne); free(hc); return -1; }
+        for (int i=0;i<nn;i++){
+            put_u64(hc+OBJ_HDR_BYTES+(size_t)(nx+i)*EXTENT_BYTES+EXT_StartSector,ne[i].start_sector);
+            put_u64(hc+OBJ_HDR_BYTES+(size_t)(nx+i)*EXTENT_BYTES+EXT_ClusterCount,ne[i].cluster_count);
+        }
+        nx=(uint16_t)(nx+nn); have=need; free(ne);
+        put_u16(hc+OBJ_ExtentCount,nx); put_u64(hc+OBJ_ClusterCount,have);
+        sb_adjust_free(f,g,-(int64_t)add);
+    }
+    put_u64(hc+OBJ_Length,bytes);
+    put_u32(hc+OBJ_HdrCheck,sum_words(hc,OBJ_HdrCheck));
+    write_run(f,g,hdr_sec,1,hc);
+    if (bytes){
+        uint8_t *stream=calloc((size_t)have,cb); memcpy(stream,entries,(size_t)bytes);
+        uint64_t off=0;
+        for (uint16_t x=0;x<nx && off<have;x++){
+            uint64_t es=get_u64(hc+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_StartSector);
+            uint64_t ec=get_u64(hc+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_ClusterCount);
+            for (uint64_t k=0;k<ec && off<have;k++) write_run(f,g,es+(k<<g->log2_secs_per_clu),1,stream+(off++)*cb);
+        }
+        free(stream);
+    }
+    free(hc); return 0;
+}
 
 /* find `name` in directory at dir_sec; returns 1 + fills out_sec/out_type */
 static int dir_find(FILE *f, const gfc_geom *g, uint64_t dir_sec, const char *name,
                     uint64_t *out_sec, uint8_t *out_type){
-    uint32_t cb=1u<<g->log2_bpmb; uint8_t *d=calloc(1,cb);
-    read_run(f,g,dir_sec,1,d);
-    uint32_t n=get_u32(d+OBJ_HDR_BYTES); int found=0;
+    uint8_t *ents=NULL; uint32_t n=dir_load(f,g,dir_sec,&ents); int found=0;
     for (uint32_t e=0;e<n;e++){
-        const uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        const uint8_t *de=ents+(size_t)e*DIRENT_BYTES;
         char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
         for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
         if(!strcmp(nm,name)){ if(out_sec)*out_sec=get_u64(de+DE_StartSector); if(out_type)*out_type=de[DE_Type]; found=1; break; }
     }
-    free(d); return found;
+    free(ents); return found;
 }
 
 /* descend the leading components of `path`, returning the parent dir sector
@@ -447,24 +506,20 @@ static uint64_t resolve_dir(FILE *f, const gfc_geom *g, const char *path){
     return cur;
 }
 
-/* append an entry to the directory at dir_sec; -1 if the (single-cluster) dir is full */
+/* append an entry to the directory at dir_sec; grows the dir as needed; -1 only on no space */
 static int dir_add_entry(FILE *f, const gfc_geom *g, uint64_t dir_sec, const char *name,
                          uint8_t type, uint32_t load, uint32_t exec, uint64_t length, uint64_t start_sec){
-    uint32_t cb=1u<<g->log2_bpmb; uint8_t *d=calloc(1,cb);
-    read_run(f,g,dir_sec,1,d);
-    uint32_t n=get_u32(d+OBJ_HDR_BYTES);
-    uint64_t capb=get_u64(d+OBJ_ClusterCount)*cb;
-    if (OBJ_HDR_BYTES+4+(uint64_t)(n+1)*DIRENT_BYTES > capb){ free(d); return -1; }
-    uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)n*DIRENT_BYTES;
+    uint8_t *ents=NULL; uint32_t n=dir_load(f,g,dir_sec,&ents);
+    uint8_t *grown=realloc(ents,(size_t)(n+1)*DIRENT_BYTES);
+    if (!grown){ free(ents); return -1; }
+    ents=grown;
+    uint8_t *de=ents+(size_t)n*DIRENT_BYTES;
     memset(de,0,DIRENT_BYTES); memset(de+DE_Name,' ',DE_NameLen);
     { size_t l=strlen(name); if(l>DE_NameLen)l=DE_NameLen; memcpy(de+DE_Name,name,l); }
     de[DE_Type]=type; de[DE_Attrs]=0x03;
     put_u32(de+DE_Load,load); put_u32(de+DE_Exec,exec);
     put_u64(de+DE_Length,length); put_u64(de+DE_StartSector,start_sec);
-    put_u32(d+OBJ_HDR_BYTES,n+1);
-    put_u64(d+OBJ_Length,4+(uint64_t)(n+1)*DIRENT_BYTES);
-    put_u32(d+OBJ_HdrCheck,sum_words(d,OBJ_HdrCheck));
-    write_run(f,g,dir_sec,1,d); free(d); return 0;
+    int rc=dir_store(f,g,dir_sec,ents,n+1); free(ents); return rc;
 }
 
 /* ====================================================================== */
@@ -636,9 +691,20 @@ static int collect_tree(FILE *f, const gfc_geom *g, uint64_t dir_sec, cluset *s,
     if (get_u32(d+OBJ_Magic)!=GFC_OBJ_MAGIC) CFAIL("dir @ %llu bad magic",(unsigned long long)dir_sec);
     if (d[OBJ_Type]!=OBJ_TYPE_DIR) CFAIL("object @ %llu is not a directory",(unsigned long long)dir_sec);
     if (get_u32(d+OBJ_HdrCheck)!=sum_words(d,OBJ_HdrCheck)) CFAIL("dir @ %llu header checksum",(unsigned long long)dir_sec);
-    uint32_t n=get_u32(d+OBJ_HDR_BYTES);
+    /* this directory's own entry-data clusters (extent-backed, design/11) */
+    { uint16_t dnx=get_u16(d+OBJ_ExtentCount); uint64_t ddc=0;
+      for (uint16_t x=0;x<dnx;x++){
+          uint64_t es=get_u64(d+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_StartSector);
+          uint64_t ec=get_u64(d+OBJ_HDR_BYTES+(size_t)x*EXTENT_BYTES+EXT_ClusterCount);
+          for (uint64_t k=0;k<ec;k++){ uint64_t sec=es+(k<<g->log2_secs_per_clu);
+              if (sec>=g->total_sectors){ CFAIL("dir @ %llu extent out of range",(unsigned long long)dir_sec); break; }
+              cluset_add(s,g,sec); }
+          ddc+=ec; }
+      if (ddc!=get_u64(d+OBJ_ClusterCount)) CFAIL("dir @ %llu DataClusters != sum of extents",(unsigned long long)dir_sec);
+    }
+    uint8_t *ents=NULL; uint32_t n=dir_load(f,g,dir_sec,&ents);
     for (uint32_t e=0;e<n;e++){
-        const uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        const uint8_t *de=ents+(size_t)e*DIRENT_BYTES;
         uint64_t st=get_u64(de+DE_StartSector); uint8_t ty=de[DE_Type];
         char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
         for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
@@ -668,7 +734,7 @@ static int collect_tree(FILE *f, const gfc_geom *g, uint64_t dir_sec, cluset *s,
             free(hc);
         }
     }
-    free(d); return err;
+    free(ents); free(d); return err;
 }
 #undef CFAIL
 
@@ -947,19 +1013,17 @@ static int cmd_ls(int argc, char **argv)
     if (load_geom(f,&g,sb,4096,err,sizeof err)){ fprintf(stderr,"%s\n",err); fclose(f); return 1; }
     uint64_t dir_sec=resolve_dir(f,&g,path);
     if (!dir_sec){ fprintf(stderr,"directory not found: %s\n",path); fclose(f); return 1; }
-    uint8_t *d=calloc(1,1u<<g.log2_bpmb);
-    if (read_run(f,&g,dir_sec,1,d)){ fprintf(stderr,"cannot read directory\n"); free(d); fclose(f); return 1; }
-    uint32_t nent=get_u32(d+OBJ_HDR_BYTES);
+    uint8_t *ents=NULL; uint32_t nent=dir_load(f,&g,dir_sec,&ents);
     printf("%s (%u object%s)\n", (path&&*path)?path:"$", nent, nent==1?"":"s");
     for (uint32_t e=0;e<nent;e++){
-        const uint8_t *de=d+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        const uint8_t *de=ents+(size_t)e*DIRENT_BYTES;
         char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
         for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
         printf("  %-12s  %-4s  %10llu bytes  load=%08x exec=%08x\n",
                nm, de[DE_Type]==OBJ_TYPE_DIR?"dir":"file",
                (unsigned long long)get_u64(de+DE_Length), get_u32(de+DE_Load), get_u32(de+DE_Exec));
     }
-    free(d); fclose(f); return 0;
+    free(ents); fclose(f); return 0;
 }
 
 static int cmd_mkfile(int argc, char **argv)
@@ -979,14 +1043,10 @@ static int cmd_mkfile(int argc, char **argv)
     gfc_fseek(s,0,SEEK_END); uint64_t fsize=(uint64_t)gfc_ftell(s); gfc_fseek(s,0,SEEK_SET);
     uint64_t data_clu=ceil_div(fsize, clu_bytes);          /* data clusters (header is separate) */
 
-    /* precheck free space (header + data) before mutating anything */
-    if (total_free_clusters(f,&g) < data_clu+1){
+    /* precheck free space (header + data + a possible dir-growth cluster) */
+    if (total_free_clusters(f,&g) < data_clu+2){
         fprintf(stderr,"not enough free space (%llu clusters needed)\n",(unsigned long long)(data_clu+1));
         fclose(s); fclose(f); return 1; }
-    /* precheck parent directory has room (avoid orphaning clusters) */
-    { uint8_t *pd=calloc(1,clu_bytes); read_run(f,&g,parent,1,pd);
-      uint32_t pn=get_u32(pd+OBJ_HDR_BYTES); uint64_t cap=get_u64(pd+OBJ_ClusterCount)*clu_bytes; free(pd);
-      if (OBJ_HDR_BYTES+4+(uint64_t)(pn+1)*DIRENT_BYTES > cap){ fprintf(stderr,"directory full\n"); fclose(s); fclose(f); return 1; } }
 
     char tag[80]; snprintf(tag,sizeof tag,"mkfile %s",name);
     int jrn = (jopen(imgp,f,&g)==0);
@@ -1085,11 +1145,10 @@ static int cmd_delete(int argc, char **argv)
     /* resolve path -> parent dir; find the entry index/type */
     char leaf[64]; uint64_t parent=resolve_parent(f,&g,name,leaf,sizeof leaf);
     if (!parent){ fprintf(stderr,"'%s' not found\n",name); fclose(f); return 1; }
-    uint8_t *dir=calloc(1,clu_bytes);
-    read_run(f,&g,parent,1,dir);
-    uint32_t nent=get_u32(dir+OBJ_HDR_BYTES); uint32_t idx=nent; uint64_t hdr_sec=0; uint8_t ty=0;
+    uint8_t *dir=NULL; uint32_t nent=dir_load(f,&g,parent,&dir);
+    uint32_t idx=nent; uint64_t hdr_sec=0; uint8_t ty=0;
     for (uint32_t e=0;e<nent;e++){
-        const uint8_t *de=dir+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        const uint8_t *de=dir+(size_t)e*DIRENT_BYTES;
         char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
         for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
         if (!strcmp(nm,leaf)){ idx=e; hdr_sec=get_u64(de+DE_StartSector); ty=de[DE_Type]; break; }
@@ -1099,7 +1158,7 @@ static int cmd_delete(int argc, char **argv)
     /* read the object; refuse to delete a non-empty directory */
     uint8_t *hc=calloc(1,clu_bytes);
     read_run(f,&g,hdr_sec,1,hc);
-    if (ty==OBJ_TYPE_DIR && get_u32(hc+OBJ_HDR_BYTES)!=0){
+    if (ty==OBJ_TYPE_DIR && get_u64(hc+OBJ_Length)!=0){
         fprintf(stderr,"'%s' is a non-empty directory\n",name); free(hc); free(dir); fclose(f); return 1; }
 
     /* gather clusters to free: header + every extent cluster */
@@ -1118,13 +1177,9 @@ static int cmd_delete(int argc, char **argv)
     int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
     free_clusters(f,&g,secs,(int)nf);
     sb_adjust_free(f,&g,(int64_t)nf);                 /* clusters returned to free space */
-    uint8_t *base=dir+OBJ_HDR_BYTES+4;
-    memmove(base+(size_t)idx*DIRENT_BYTES, base+(size_t)(idx+1)*DIRENT_BYTES,
+    memmove(dir+(size_t)idx*DIRENT_BYTES, dir+(size_t)(idx+1)*DIRENT_BYTES,
             (size_t)(nent-idx-1)*DIRENT_BYTES);
-    put_u32(dir+OBJ_HDR_BYTES,nent-1);
-    put_u64(dir+OBJ_Length,4+(uint64_t)(nent-1)*DIRENT_BYTES);
-    put_u32(dir+OBJ_HdrCheck,sum_words(dir,OBJ_HdrCheck));
-    write_run(f,&g,parent,1,dir);
+    dir_store(f,&g,parent,dir,nent-1);
     if (jrn){ jcommit(); jclose(); }
     free(secs); free(dir); fclose(f);
 
@@ -1144,10 +1199,7 @@ static int cmd_mkdir(int argc, char **argv)
     char leaf[64]; uint64_t parent=resolve_parent(f,&g,path,leaf,sizeof leaf);
     if (!parent){ fprintf(stderr,"path not found: %s\n",path); fclose(f); return 1; }
     if (dir_find(f,&g,parent,leaf,NULL,NULL)){ fprintf(stderr,"'%s' already exists\n",path); fclose(f); return 1; }
-    if (total_free_clusters(f,&g) < 1){ fprintf(stderr,"no free space\n"); fclose(f); return 1; }
-    { uint8_t *pd=calloc(1,clu_bytes); read_run(f,&g,parent,1,pd);
-      uint32_t pn=get_u32(pd+OBJ_HDR_BYTES); uint64_t cap=get_u64(pd+OBJ_ClusterCount)*clu_bytes; free(pd);
-      if (OBJ_HDR_BYTES+4+(uint64_t)(pn+1)*DIRENT_BYTES > cap){ fprintf(stderr,"parent directory full\n"); fclose(f); return 1; } }
+    if (total_free_clusters(f,&g) < 2){ fprintf(stderr,"no free space\n"); fclose(f); return 1; }
 
     char tag[80]; snprintf(tag,sizeof tag,"mkdir %s",path);
     int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
@@ -1155,28 +1207,18 @@ static int cmd_mkdir(int argc, char **argv)
     if (alloc_clusters(f,&g,1,&he,&nh,1)){ fprintf(stderr,"allocation failed\n"); fclose(f); return 1; }
     uint8_t *dc=calloc(1,clu_bytes);
     uint64_t objid=((uint64_t)sec_to_ag(&g,he.start_sector)<<GFC_OBJID_LOCALBITS)|sec_to_localclu(&g,he.start_sector);
-    build_obj_header(dc,objid,OBJ_TYPE_DIR,0x03,0,0,0,4,he.start_sector,1,leaf);
-    put_u32(dc+OBJ_HDR_BYTES,0);   /* EntryCount = 0 */
+    /* empty extent-backed directory (no data clusters until first entry) */
+    build_obj_header(dc,objid,OBJ_TYPE_DIR,0x03,0,0,0,0,he.start_sector,0,leaf);
     write_run(f,&g,he.start_sector,1,dc);
     free(dc);
-    dir_add_entry(f,&g,parent,leaf,OBJ_TYPE_DIR,0,0,4,he.start_sector);
-    sb_adjust_free(f,&g,-1);                          /* one cluster for the directory */
+    sb_adjust_free(f,&g,-1);                          /* the directory header cluster */
+    dir_add_entry(f,&g,parent,leaf,OBJ_TYPE_DIR,0,0,0,he.start_sector);
     if (jrn){ jcommit(); jclose(); }
     fclose(f);
     printf("created directory '%s' at sector %llu\n",path,(unsigned long long)he.start_sector);
     return 0;
 }
 
-/* remove entry `idx` from a dir cluster buffer (caller writes it back) */
-static void dir_remove_idx(uint8_t *d, uint32_t idx){
-    uint32_t n=get_u32(d+OBJ_HDR_BYTES);
-    uint8_t *base=d+OBJ_HDR_BYTES+4;
-    memmove(base+(size_t)idx*DIRENT_BYTES, base+(size_t)(idx+1)*DIRENT_BYTES,
-            (size_t)(n-idx-1)*DIRENT_BYTES);
-    put_u32(d+OBJ_HDR_BYTES,n-1);
-    put_u64(d+OBJ_Length,4+(uint64_t)(n-1)*DIRENT_BYTES);
-    put_u32(d+OBJ_HdrCheck,sum_words(d,OBJ_HdrCheck));
-}
 
 static int cmd_rename(int argc, char **argv)
 {
@@ -1190,11 +1232,10 @@ static int cmd_rename(int argc, char **argv)
     /* locate source entry in its parent */
     char oleaf[64]; uint64_t op=resolve_parent(f,&g,oldp,oleaf,sizeof oleaf);
     if (!op){ fprintf(stderr,"'%s' not found\n",oldp); fclose(f); return 1; }
-    uint8_t *od=calloc(1,clu_bytes); read_run(f,&g,op,1,od);
-    uint32_t on=get_u32(od+OBJ_HDR_BYTES), oidx=on;
+    uint8_t *od=NULL; uint32_t on=dir_load(f,&g,op,&od), oidx=on;
     uint64_t hdr_sec=0,len=0; uint32_t load=0,exec=0; uint8_t ty=0;
     for (uint32_t e=0;e<on;e++){
-        const uint8_t *de=od+OBJ_HDR_BYTES+4+(size_t)e*DIRENT_BYTES;
+        const uint8_t *de=od+(size_t)e*DIRENT_BYTES;
         char nm[13]; memcpy(nm,de+DE_Name,12); nm[12]=0;
         for(int k=11;k>=0&&(nm[k]==' '||!nm[k]);k--) nm[k]=0;
         if(!strcmp(nm,oleaf)){ oidx=e; hdr_sec=get_u64(de+DE_StartSector); len=get_u64(de+DE_Length);
@@ -1206,9 +1247,7 @@ static int cmd_rename(int argc, char **argv)
     char nleaf[64]; uint64_t np=resolve_parent(f,&g,newp,nleaf,sizeof nleaf);
     if (!np){ fprintf(stderr,"destination path not found: %s\n",newp); free(od); fclose(f); return 1; }
     if (dir_find(f,&g,np,nleaf,NULL,NULL)){ fprintf(stderr,"'%s' already exists\n",newp); free(od); fclose(f); return 1; }
-    { uint8_t *pd=calloc(1,clu_bytes); read_run(f,&g,np,1,pd);
-      uint32_t pn=get_u32(pd+OBJ_HDR_BYTES); uint64_t cap=get_u64(pd+OBJ_ClusterCount)*clu_bytes; free(pd);
-      if (np!=op && OBJ_HDR_BYTES+4+(uint64_t)(pn+1)*DIRENT_BYTES>cap){ fprintf(stderr,"destination directory full\n"); free(od); fclose(f); return 1; } }
+    /* directories grow on demand; no destination-capacity precheck needed */
 
     char tag[96]; snprintf(tag,sizeof tag,"rename %s -> %s",oldp,newp);
     int jrn=(jopen(imgp,f,&g)==0); if(jrn) jbegin(tag);
@@ -1222,15 +1261,15 @@ static int cmd_rename(int argc, char **argv)
 
     if (np==op){
         /* same directory: rename the entry in place */
-        uint8_t *de=od+OBJ_HDR_BYTES+4+(size_t)oidx*DIRENT_BYTES;
+        uint8_t *de=od+(size_t)oidx*DIRENT_BYTES;
         memset(de+DE_Name,' ',DE_NameLen);
         { size_t l=strlen(nleaf); if(l>DE_NameLen)l=DE_NameLen; memcpy(de+DE_Name,nleaf,l); }
-        put_u32(od+OBJ_HdrCheck,sum_words(od,OBJ_HdrCheck));
-        write_run(f,&g,op,1,od);
+        dir_store(f,&g,op,od,on);
     } else {
         /* move: remove from old parent, add to new parent */
-        dir_remove_idx(od,oidx);
-        write_run(f,&g,op,1,od);
+        memmove(od+(size_t)oidx*DIRENT_BYTES, od+(size_t)(oidx+1)*DIRENT_BYTES,
+                (size_t)(on-oidx-1)*DIRENT_BYTES);
+        dir_store(f,&g,op,od,on-1);
         dir_add_entry(f,&g,np,nleaf,ty,load,exec,len,hdr_sec);
     }
     if (jrn){ jcommit(); jclose(); }
