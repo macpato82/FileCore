@@ -1,4 +1,4 @@
-# FileCore Large-Disc Format
+# FileCore Large-Disc Format and EXT Formats
 
 Design and reference work for FileCore
 adding a new native disc format to RISC OS's filing systems for large discs.
@@ -122,9 +122,9 @@ tools/armcheck/ Host-side verifier for the ARM patch address arithmetic
 - [`design/11-MultiClusterDirs-v1.md`](design/11-MultiClusterDirs-v1.md) — multi-cluster (extent-backed) directories.
 - [`design/12-MaxDrives256-Sweep.md`](design/12-MaxDrives256-Sweep.md) — complete `MaxDrives>8` change sweep (sentinel, loops, M3c, bump).
 
-## Related bounty — #10 Partitioning (MBR + GPT)
+Partitioning (MBR + GPT)
 
-[ROOL bounty #10](https://www.riscosopen.org/bounty/polls/10) is a complementary follow-on:
+complementary follow-on:
 support for **MBR** and **GPT** partition tables, a rewritten **HForm** (Toolbox front end + a
 scriptable interface for 3rd-party filing systems) that lays down / respects partitions before the
 FileCore area, and adapting the desktop filers (one icon per physical drive today) and the `!Boot`
@@ -133,7 +133,7 @@ search to select a partition. #10 explicitly does **not** extend FileCore (it ke
 bounty, which is essentially this work (#40). So they dovetail: **#10 = the partition-table layer
 around FileCore; #40 = the large-disc FileCore (256 drives × 16 EB, DiscOp64) for the huge drives
 GPT enables.** Plan sketch:
-[`design/13-Bounty10-Partitioning-Plan.md`](design/13-Bounty10-Partitioning-Plan.md).
+(design/13-Bounty10-Partitioning-Plan.md).
 
 ## Related — EXT4 (ext2/3/4) filing system
 
