@@ -122,6 +122,18 @@ tools/armcheck/ Host-side verifier for the ARM patch address arithmetic
 - [`design/11-MultiClusterDirs-v1.md`](design/11-MultiClusterDirs-v1.md) — multi-cluster (extent-backed) directories.
 - [`design/12-MaxDrives256-Sweep.md`](design/12-MaxDrives256-Sweep.md) — complete `MaxDrives>8` change sweep (sentinel, loops, M3c, bump).
 
+## Related bounty — #10 Partitioning (MBR + GPT)
+
+[ROOL bounty #10](https://www.riscosopen.org/bounty/polls/10) is a complementary follow-on:
+support for **MBR** and **GPT** partition tables, a rewritten **HForm** (Toolbox front end + a
+scriptable interface for 3rd-party filing systems) that lays down / respects partitions before the
+FileCore area, and adapting the desktop filers (one icon per physical drive today) and the `!Boot`
+search to select a partition. #10 explicitly does **not** extend FileCore (it keeps the 2²⁹-sector /
+2¹²-byte-sector / 20-partitions / 23-logical-drive limits) — it defers "huge drives" to a future
+bounty, which is essentially this work (#40). So they dovetail: **#10 = the partition-table layer
+around FileCore; #40 = the large-disc FileCore (256 drives × 16 EB, DiscOp64) for the huge drives
+GPT enables.**
+
 ## License
 
 FileCore upstream is Apache-2.0. Design documents here are released under the same terms unless noted.
