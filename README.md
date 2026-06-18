@@ -132,7 +132,8 @@ search to select a partition. #10 explicitly does **not** extend FileCore (it ke
 2¹²-byte-sector / 20-partitions / 23-logical-drive limits) — it defers "huge drives" to a future
 bounty, which is essentially this work (#40). So they dovetail: **#10 = the partition-table layer
 around FileCore; #40 = the large-disc FileCore (256 drives × 16 EB, DiscOp64) for the huge drives
-GPT enables.**
+GPT enables.** Plan sketch:
+[`design/13-Bounty10-Partitioning-Plan.md`](design/13-Bounty10-Partitioning-Plan.md).
 
 ## License
 
