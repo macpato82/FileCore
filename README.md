@@ -135,6 +135,17 @@ around FileCore; #40 = the large-disc FileCore (256 drives × 16 EB, DiscOp64) f
 GPT enables.** Plan sketch:
 [`design/13-Bounty10-Partitioning-Plan.md`](design/13-Bounty10-Partitioning-Plan.md).
 
+## Related — EXT4 (ext2/3/4) filing system
+
+A third "modern storage" strand (own track): a standalone FileSwitch filing-system module
+(`EXT4FS`) to mount **ext2/3/4** partitions — **read-only first**, write later. A Linux partition
+recognised by the #10 `PartitionManager` is handed to `EXT4FS`, which reads it over the same
+block-device / DiscOp64 seam. Independent of FileCore's own format. Plan sketch:
+[`design/14-EXT4FS-Plan.md`](design/14-EXT4FS-Plan.md).
+
+Together the three strands give modern RISC OS storage: **GPT/MBR-partitioned large drives** (#10),
+carrying **native FileCore G-format huge discs** (#40) **and** **ext2/3/4 partitions** (EXT4FS).
+
 ## License
 
 FileCore upstream is Apache-2.0. Design documents here are released under the same terms unless noted.
